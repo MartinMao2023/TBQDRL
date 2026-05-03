@@ -29,7 +29,7 @@ critic_epochs = 4
 fitness_critic_epochs = 4
 policy_learning_rate = 3e-4
 critic_learning_rate = 5e-4
-rollout_length = 64
+rollout_length = 32
 
 description = {
         "task": "LineEncoder test finte matern BRPG",
@@ -146,47 +146,41 @@ loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
 states = jax.vmap(env.reset)(subkeys)
-
-carry = (states, ppo_training_state, loop_random_key)
+carry = (states, ppo_training_state, jnp.zeros((vec_env,)), loop_random_key)
 
 
 def training_loop(
-    carry: Tuple[GeneralizedState, QDPPOTrainingState, RNGKey], 
+    carry: Tuple[GeneralizedState, QDPPOTrainingState, jax.Array, RNGKey], 
     _: None,
     ) -> Tuple[Tuple, Tuple]:
 
-    states, ppo_training_state, loop_random_key = carry
+    states, ppo_training_state, step_count, loop_random_key = carry
 
-    (final_states, sampled_states, ppo_training_state, loop_random_key), aux_data = ppo.train(
+    (final_states, sampled_states, ppo_training_state, step_count, loop_random_key), aux_data = ppo.train(
         states,
         ppo_training_state,
+        step_count,
         loop_random_key,
     )
-
     vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
 
     # p: take the state and resample a task
     # 1 - p: continue from current task, but resample deviation 
-
-    # states1 = jax.vmap(env.resample_deviation)(states)
     restarted_states = jax.vmap(env.resample_task_state)(sampled_states)
     
     loop_random_key, subkey = jax.random.split(loop_random_key)
-    ps = jax.random.bernoulli(subkey, p=0.5, shape=(vec_env,))
+    ps = jax.random.bernoulli(subkey, p=0.5, shape=(vec_env,)) & (step_count > 94)
 
     new_states = jax.tree.map(
         lambda a, b: jax.vmap(jax.lax.select)(ps, a, b),
         restarted_states,
         final_states,
     )
-    # final_states = states2.replace(z_state=final_z_states)
-
-    # final_states = jax.vmap(env.resample_task_state)(states)
-    # vs = jnp.sqrt(jnp.sum(final_states.env_state.obs[:, 13: 15]**2, axis=-1))
 
     new_carry = (
         new_states,
         ppo_training_state,
+        step_count,
         loop_random_key,
     )
 
@@ -210,6 +204,7 @@ for i in range(int(num_iterations / log_period)):
     (
         states, 
         ppo_training_state, 
+        step_count,
         loop_random_key,
         ), (
             iteration_critic_error,
@@ -242,12 +237,14 @@ for i in range(int(num_iterations / log_period)):
         loop_random_key, subkey = jax.random.split(loop_random_key)
         subkeys = jax.random.split(subkey, num=vec_env)
         states = jax.vmap(env.reset)(subkeys)
+        step_count = jnp.zeros((vec_env,))
 
-    carry = (states, ppo_training_state, loop_random_key)
+    carry = (states, ppo_training_state, step_count, loop_random_key)
 
 (
     final_states, 
     final_ppo_training_state, 
+    step_count,
     loop_random_key,
 ) = carry
 

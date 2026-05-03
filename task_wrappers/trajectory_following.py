@@ -290,8 +290,12 @@ class FiniteMaternWrapper(BaseQDTaskWrapper):
         return state
     
 
+    # def resample_initial_z_state(self: GeneralizedState) -> GeneralizedState:
+    #     """resample initial task state"""
+    #     key, subkey = jax.random.split(state.key)
+    #     initial_z_state = self._init_task_state(state.env_state, subkey)
+    #     state = state.replace(z_state=z_state, key=key)
+    #     return state
+
     
-
-
-
 
