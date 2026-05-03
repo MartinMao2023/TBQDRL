@@ -17,7 +17,7 @@ from algorithms.test_qd_ppo import QDPPO, QDPPOConfigs, QDPPOTrainingState
 from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
 # from functools import partial
 from flax import serialization
-from task_wrappers.trajectory_following import AntMaternWrapper
+from task_wrappers.trajectory_following import FiniteMaternWrapper
 from data_struct.states import GeneralizedState
 
 
@@ -99,7 +99,7 @@ loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
-env = AntMaternWrapper(env, var=2.25)
+env = FiniteMaternWrapper(env, var=2.25)
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (64, 64)
@@ -157,35 +157,35 @@ def training_loop(
 
     states, ppo_training_state, loop_random_key = carry
 
-    (states, ppo_training_state, loop_random_key), aux_data = ppo.train(
+    (final_states, sampled_states, ppo_training_state, loop_random_key), aux_data = ppo.train(
         states,
         ppo_training_state,
         loop_random_key,
     )
 
-    vs = jnp.sqrt(jnp.sum(states.env_state.obs[:, 13: 15]**2, axis=-1))
+    vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
 
     # p: take the state and resample a task
     # 1 - p: continue from current task, but resample deviation 
 
-    states1 = jax.vmap(env.resample_deviation)(states)
-    states2 = jax.vmap(env.resample_task_state)(states1)
+    # states1 = jax.vmap(env.resample_deviation)(states)
+    restarted_states = jax.vmap(env.resample_task_state)(sampled_states)
     
     loop_random_key, subkey = jax.random.split(loop_random_key)
     ps = jax.random.bernoulli(subkey, p=0.5, shape=(vec_env,))
 
-    final_z_states = jax.tree.map(
+    new_states = jax.tree.map(
         lambda a, b: jax.vmap(jax.lax.select)(ps, a, b),
-        states1.z_state,
-        states2.z_state,
+        restarted_states,
+        final_states,
     )
-    final_states = states2.replace(z_state=final_z_states)
+    # final_states = states2.replace(z_state=final_z_states)
 
     # final_states = jax.vmap(env.resample_task_state)(states)
     # vs = jnp.sqrt(jnp.sum(final_states.env_state.obs[:, 13: 15]**2, axis=-1))
 
     new_carry = (
-        final_states,
+        new_states,
         ppo_training_state,
         loop_random_key,
     )

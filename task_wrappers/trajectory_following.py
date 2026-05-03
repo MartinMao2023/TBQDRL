@@ -42,7 +42,7 @@ class GeneralizedState:
 
 
 
-class MaternWrapper(BaseQDTaskWrapper):
+class FiniteMaternWrapper(BaseQDTaskWrapper):
     def __init__(
         self, 
         env: Env, 

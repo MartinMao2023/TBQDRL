@@ -168,12 +168,17 @@ class QDPPO:
                     keepdims=True,
                     ) # shape of (1,)
                 
-                next_state, transition_info = env.step(state, action)
+                fitness_gaes = jnp.where(
+                    state.z_state.remaining_t > 0,
+                    jnp.zeros((1,)),
+                    jnp.ones((1,))) # <----  we use this to indicate if the task has finished
+                
+                state, transition_info = env.step(state, action)
                 key, subkey = jax.random.split(key)
                 if_replace = jax.random.uniform(subkey) < 1 / l
                 sampled_state = jax.tree.map(
                     lambda x, y: jax.lax.select(if_replace, x, y), 
-                    next_state, 
+                    state, 
                     sampled_state
                 )
 
@@ -187,13 +192,13 @@ class QDPPO:
                     td_lambda_returns=jnp.zeros((1,)),
                     fitness_td_lambda_returns=jnp.zeros((1,)),
                     gaes=jnp.zeros((1,)),
-                    fitness_gaes=jnp.zeros((1,)),
+                    fitness_gaes=fitness_gaes,
                     dones=transition_info.done,
                     truncations=transition_info.truncation,
                     weights=jnp.zeros((1,)),
                     )
 
-                return (next_state, sampled_state, l + 1, key), transition
+                return (state, sampled_state, l + 1, key), transition
 
             final_carry, transitions = jax.lax.scan(
                 lambda x, _: jax.vmap(play_step_fn)(x),
@@ -202,9 +207,9 @@ class QDPPO:
             )
 
             final_states, sampled_states = final_carry[:2]
-            final_obs, final_zs = self._env.get_obs(final_states)
-
-            return final_obs, final_zs, sampled_states, transitions
+            # final_obs, final_zs = self._env.get_obs(final_states)
+            # return final_obs, final_zs, sampled_states, transitions
+            return final_states, sampled_states, transitions
         
         self._rollout_fn = rollout_fn
 
@@ -261,19 +266,12 @@ class QDPPO:
                 log_ratio = new_log_likelihood - transitions.log_likelihood
                 ratio = jnp.exp(log_ratio)
 
-                # gaes = (transitions.gaes + transitions.fitness_gaes) * 0.5
-                gaes = jnp.where(
-                    transitions.gaes * transitions.fitness_gaes > 0,
-                    transitions.gaes + transitions.fitness_gaes,
-                    transitions.gaes
-                    )
+                gaes = transitions.gaes
                 loss_cond = jax.lax.stop_gradient(log_ratio * gaes <= self._clip_log_ratio * jnp.abs(gaes))
                 clip_fraction = 1 - jnp.mean(loss_cond)
                 approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
 
                 loss = jnp.mean((jnp.where(loss_cond, -gaes * ratio, 0.0) - ppo_configs.entropy_gain * entropy))
-                # extra_loss_cond = jax.lax.stop_gradient(log_ratio * gaes > 0.693 * jnp.abs(gaes))
-                # loss = loss + jnp.mean(jnp.where(extra_loss_cond, ratio - log_ratio, 0.0))
 
                 return loss, (approx_kl, clip_fraction)
             
@@ -292,19 +290,12 @@ class QDPPO:
                 log_ratio = new_log_likelihood - transitions.log_likelihood
                 ratio = jnp.exp(log_ratio)
 
-                gaes = jnp.where(
-                    transitions.gaes * transitions.fitness_gaes > 0,
-                    transitions.gaes + transitions.fitness_gaes,
-                    transitions.gaes
-                    )
-                # gaes = (transitions.gaes + transitions.fitness_gaes) * 0.5
+                gaes = transitions.gaes
                 loss_cond = jax.lax.stop_gradient(log_ratio * gaes <= self._clip_log_ratio * jnp.abs(gaes))
                 clip_fraction = 1 - jnp.mean(loss_cond)
                 approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
 
                 loss = jnp.mean(jnp.where(loss_cond, -gaes * ratio, 0.0))
-                # extra_loss_cond = jax.lax.stop_gradient(log_ratio * gaes > 0.693 * jnp.abs(gaes))
-                # loss = loss + jnp.mean(jnp.where(extra_loss_cond, ratio - log_ratio, 0.0))
                 
                 return loss, (approx_kl, clip_fraction)
 
@@ -663,14 +654,15 @@ class QDPPO:
         key, subkey = jax.random.split(key)
         subkeys = jax.random.split(subkey, num=self.configs.vec_env)
         (
-            final_obs, final_zs, sampled_states, transitions
+            # final_obs, final_zs, sampled_states, transitions
+            final_states, sampled_states, transitions
             ) = self._rollout_fn(
                 training_state.policy_params, 
                 starting_states, 
                 subkeys, 
                 training_state.current_std,
                 )
-        # final_obs, final_zs = self._env.get_obs(states)
+        final_obs, final_zs = self._env.get_obs(final_states)
 
         final_v = nn.sigmoid(
             self._critic_network.apply(training_state.critic_params, final_obs, final_zs)
@@ -710,10 +702,18 @@ class QDPPO:
             (gaes - jnp.mean(gaes)) * (fitness_gaes - jnp.mean(fitness_gaes))
         ) / (jnp.var(gaes) + 1e-6)
 
+
+        conditioned_gaes = jnp.where(gaes * fitness_gaes > 0, gaes + fitness_gaes, gaes)
+        final_gaes = jnp.where(
+            transitions.fitness_gaes > 0.5, # if task complete
+            gaes + fitness_gaes,
+            conditioned_gaes,
+        )
+
         transitions = transitions.replace(
             td_lambda_returns=new_v_values,
             fitness_td_lambda_returns=new_fitness_v_values,
-            gaes=gaes,
+            gaes=final_gaes,
             fitness_gaes=fitness_gaes,
             weights=weights,
             )
@@ -740,7 +740,7 @@ class QDPPO:
         training_data = training_data.replace(coef=coef, raw_coef=raw_coef)
         aux_data = QDAuxData(rollout_data=rollout_data, training_data=training_data)
 
-        return (sampled_states, new_training_state, key), aux_data
+        return (final_states, sampled_states, new_training_state, key), aux_data
 
 
 
