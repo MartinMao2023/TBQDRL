@@ -111,7 +111,8 @@ class QDPPO:
             self._clip_log_ratio = jnp.log(1 + ppo_configs.clip_ratio)
         else:
             raise(ValueError("invalid clip ratio"))
-        
+
+
         def make_ppo_optimizer(learning_rate):
             return optax.adam(learning_rate=learning_rate)
         
