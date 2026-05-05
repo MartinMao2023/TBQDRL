@@ -17,7 +17,7 @@ from .tools import IntegrateMatern
 
 
 
-class MaternTaskState:
+class MaternTaskState(PyTreeNode):
     position_offset: jax.Array # (2,)
 
     normalized_ds: jax.Array # (2, way_points)
@@ -34,9 +34,17 @@ class MaternTaskState:
     z: jnp.ndarray # (-1,)
 
 
-class GeneralizedState:
+
+class State_info(PyTreeNode):
+    current_velocity: jax.Array # (2,)
+    current_position: jax.Array # (2,)
+
+
+
+class GeneralizedState(PyTreeNode):
     env_state: State
     z_state: MaternTaskState
+    initial_state_info: State_info # used to resample initial_z_state
     initial_z_state: MaternTaskState # used in reset
     key: jax.Array
 
@@ -125,12 +133,19 @@ class FiniteMaternWrapper(BaseQDTaskWrapper):
         return env_state.pipeline_state.x.pos[0, :2] # (2,)
     
 
-    def _init_task_state(self, env_state: State, key: jax.Array) -> PyTreeNode:
+    def _extract_state_info_for_task(self, env_state: State) -> State_info:
+        state_info = State_info(
+            current_position=self.get_position_from_envstate(env_state),
+            current_velocity=self.get_velocity_from_envstate(env_state),
+            )
+        return state_info
+    
+
+    def _init_task_state(self, state_info: State_info, key: jax.Array) -> PyTreeNode:
         """initialize task state"""
 
         # sample way_points data
-        current_velocity = self.get_velocity_from_envstate(env_state) # (2,)
-        mean_ys = self.posterior_mu_T * current_velocity[:, None] # (2, 2 * waypoints + 1)
+        mean_ys = self.posterior_mu_T * state_info.current_velocity[:, None] # (2, 2 * waypoints + 1)
         key, subkey = jax.random.split(key)
         ys = mean_ys + jax.random.normal(subkey, (2, 2 * self.way_points + 1)) @ self.posterior_L # (2, 2 * way_points + 1)
 
@@ -147,7 +162,7 @@ class FiniteMaternWrapper(BaseQDTaskWrapper):
         z = jnp.concatenate([-deviation, normalized_ds, task_v, jnp.ones((2, 1))], axis=-1)
 
         new_task_state = MaternTaskState(
-            position_offset=-self.get_position_from_envstate(env_state),
+            position_offset=-state_info.current_position,
             normalized_ds=normalized_ds,
             next_normalized_ds=next_normalized_ds,
             task_s=task_s,
@@ -289,13 +304,5 @@ class FiniteMaternWrapper(BaseQDTaskWrapper):
         state = state.replace(z_state=new_task_state, key=key)
         return state
     
-
-    # def resample_initial_z_state(self: GeneralizedState) -> GeneralizedState:
-    #     """resample initial task state"""
-    #     key, subkey = jax.random.split(state.key)
-    #     initial_z_state = self._init_task_state(state.env_state, subkey)
-    #     state = state.replace(z_state=z_state, key=key)
-    #     return state
-
     
 

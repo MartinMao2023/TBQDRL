@@ -24,6 +24,11 @@ class TaskState(PyTreeNode):
     r: float
 
 
+class State_info(PyTreeNode):
+    current_velocity: jax.Array # (2,)
+    current_position: jax.Array # (2,)
+
+
 
 class LineWrapper(BaseQDTaskWrapper):
     def __init__(
@@ -61,9 +66,17 @@ class LineWrapper(BaseQDTaskWrapper):
         return env_state.pipeline_state.x.pos[0, :2] # (2,)
     
 
-    def _init_task_state(self, env_state: State, key: jax.Array) -> PyTreeNode:
+    def _extract_state_info_for_task(self, env_state: State) -> State_info:
+        state_info = State_info(
+            current_position=self.get_position_from_envstate(env_state),
+            current_velocity=self.get_velocity_from_envstate(env_state),
+            )
+        return state_info
+    
+
+    def _init_task_state(self, state_info: State_info, key: jax.Array) -> PyTreeNode:
         """initialize task state"""
-        current_velocity = self.get_velocity_from_envstate(env_state)
+        current_velocity = state_info.current_velocity
         current_speed = jnp.sqrt(jnp.sum(current_velocity**2))
 
         # find direction
@@ -193,9 +206,17 @@ class CircularWrapper(BaseQDTaskWrapper):
         return env_state.pipeline_state.x.pos[0, :2] # (2,)
     
 
-    def _init_task_state(self, env_state: State, key: jax.Array) -> PyTreeNode:
+    def _extract_state_info_for_task(self, env_state: State) -> State_info:
+        state_info = State_info(
+            current_position=self.get_position_from_envstate(env_state),
+            current_velocity=self.get_velocity_from_envstate(env_state),
+            )
+        return state_info
+    
+    
+    def _init_task_state(self, state_info: State_info, key: jax.Array) -> PyTreeNode:
         """initialize task state"""
-        current_velocity = self.get_velocity_from_envstate(env_state)
+        current_velocity = state_info.current_velocity
         current_speed = jnp.sqrt(jnp.sum(current_velocity**2))
 
         # find direction
@@ -383,10 +404,29 @@ class AntMaternWrapper(BaseQDTaskWrapper):
         return True
     
 
-    def _init_task_state(self, env_state: State, key: jax.Array) -> PyTreeNode:
-        """initialize task state"""
+    def get_velocity_from_envstate(self, env_state: State) -> jax.Array:
+        """This is for Ant, change this line if for other agent"""
         obs = env_state.obs
         current_velocity = obs[13:15] # (2,)
+        return current_velocity 
+    
+
+    def get_position_from_envstate(self, env_state: State) -> jax.Array:
+        """Change this line if doesn't work for other agent"""
+        return env_state.pipeline_state.x.pos[0, :2] # (2,)
+    
+
+    def _extract_state_info_for_task(self, env_state: State) -> State_info:
+        state_info = State_info(
+            current_position=self.get_position_from_envstate(env_state),
+            current_velocity=self.get_velocity_from_envstate(env_state),
+            )
+        return state_info
+    
+
+    def _init_task_state(self, state_info: State_info, key: jax.Array) -> PyTreeNode:
+        """initialize task state"""
+        current_velocity = state_info.current_velocity
 
         key, subkey = jax.random.split(key)
         prior_s = self.prior_mu * current_velocity[:, None] # (2, way_points)
@@ -411,7 +451,7 @@ class AntMaternWrapper(BaseQDTaskWrapper):
             ]),
             r=1.0,
             coefs=coefs,
-            position_offset=-env_state.pipeline_state.x.pos[0, :2] + deviation,
+            position_offset=-state_info.current_position + deviation,
         )
 
         return new_task_state
