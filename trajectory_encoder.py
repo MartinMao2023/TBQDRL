@@ -563,3 +563,184 @@ class LineEncoder(TaskEncoder):
 
 
 
+
+class MaternTaskState(PyTreeNode):
+    position_offset: jax.Array # (2,)
+
+    normalized_ds: jax.Array # (2, way_points)
+    next_normalized_ds: jax.Array # (2, way_points)
+
+    task_s: jax.Array # (2, way_points + 1)
+
+    task_v: jax.Array # (2, way_points + 1)
+    next_task_v: jax.Array # (2, way_points + 1)
+
+    # coefs: jnp.ndarray # (2, 4)
+    remaining_t: float # actual remaining time
+    t: float # absolute time within a period
+    z: jnp.ndarray # (-1,)
+
+
+
+class State_info(PyTreeNode):
+    current_velocity: jax.Array # (2,)
+    current_position: jax.Array # (2,)
+    
+
+
+class FiniteMaternWrapper:
+    def __init__(
+        self, 
+        horizon: float = 4,
+        way_points: int = 8,
+        var: float = 2.25,
+        l: float = 1,
+        v_noise_var: float = 0.0625,
+        dt: float = 0.05,):
+        
+        self.dt = dt
+        self.way_points = way_points
+        self.z_dim = 4 * way_points + 6 # task, deviation, time * 2
+        matern_kernel = IntegrateMatern(l)
+        self.horizon = horizon
+
+        period_t = float(horizon / way_points)
+        self.period_t = period_t
+        self.inv_period_t = 1 / period_t
+        self.ds_normalization_scale = 1 / np.sqrt(2 * l * (l * np.exp(-period_t/l) - l + period_t))
+
+        way_points_t = np.arange(way_points + 1) * period_t
+        prior_cov = np.zeros((way_points * 2 + 1, way_points * 2 + 1))
+        prior_cov[:way_points, :way_points] = matern_kernel.kernel(way_points_t[1:], way_points_t[1:])
+        prior_cov[way_points:, way_points:] = matern_kernel.derivative_kernel(way_points_t, way_points_t)
+        prior_cov[:way_points, way_points:] = matern_kernel.xv_cross_covariance(way_points_t[1:], way_points_t)
+        prior_cov[way_points:, :way_points] = prior_cov[:way_points, way_points:].T
+        Sigma22 = np.zeros((4, 4))
+        Sigma22[2:, 2:] = prior_cov[way_points: way_points + 2, way_points: way_points + 2]
+        Sigma22[1, 1] = prior_cov[0, 0]
+        Sigma22[1, 2:] = prior_cov[0, way_points: way_points + 2]
+        Sigma22[2:, 1] = prior_cov[way_points: way_points + 2, 0]
+        Sigma22 = Sigma22 + np.array([
+            [1.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ])
+        prior_cov = prior_cov * var + np.eye(way_points * 2 + 1) * 1e-8
+
+        # Posterior sampling: Sigma12 @ Sigma22_inv @ Y = Sigma12 * v / Var_y
+        Sigma12 = prior_cov[:, way_points: way_points + 1] # (all x 1)
+        self.posterior_mu_T = jnp.array(Sigma12.T / (var + v_noise_var), dtype=jnp.float32) # (1, 2 * way_points + 1)
+        posterior_cov = prior_cov - Sigma12 @ Sigma12.T / (var + v_noise_var)
+        self.posterior_L = jnp.array(lg.cholesky(posterior_cov), dtype=jnp.float32) # target = L @ X 
+
+        # Inference -> (2,)
+        self._base_fn = lambda t: jnp.array([1.0, jnp.exp(-t/l), jnp.exp(t/l), t]) # (4,)
+        A_T = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [l**2*(np.exp(-period_t/l) - 1) + 1, l**2, -l**2*np.exp(-period_t/l), 2*l],
+            [l, -l, 0.0, 0.0],
+            [-l*np.exp(-period_t/l), 0.0, l*np.exp(-period_t/l), 0.0],
+        ])
+        self.Sigma22_inv_AT = lg.solve(Sigma22, A_T) # (4, 4)
+
+    
+
+    def _init_task_state(self, state_info: State_info, key: jax.Array) -> PyTreeNode:
+        """initialize task state"""
+
+        # sample way_points data
+        mean_ys = self.posterior_mu_T * state_info.current_velocity[:, None] # (2, 2 * waypoints + 1)
+        key, subkey = jax.random.split(key)
+        ys = mean_ys + jax.random.normal(subkey, (2, 2 * self.way_points + 1)) @ self.posterior_L.T # (2, 2 * way_points + 1)
+
+        # sample deviation
+        deviation = jnp.zeros((2, 1)) # (2, 1)
+        
+        # collect data
+        task_v = ys[:, self.way_points:] # (2, way_points + 1)
+        next_task_v = jnp.concatenate([task_v[:, 1:], jnp.zeros((2, 1))], axis=-1)
+        task_s = jnp.concatenate([-deviation, ys[:, :self.way_points] - deviation], axis=-1) # (2, way_points + 1)
+        P = jnp.eye(self.way_points) - jnp.eye(self.way_points, k=1)
+        normalized_ds = ys[:, :self.way_points] @ P * self.ds_normalization_scale # (2, way_points)
+        next_normalized_ds = jnp.concatenate([normalized_ds[:, 1:], jnp.zeros((2, 1))], axis=-1)
+        z = jnp.concatenate([-deviation, normalized_ds, task_v, jnp.ones((2, 1))], axis=-1)
+
+        new_task_state = MaternTaskState(
+            position_offset=-state_info.current_position,
+            normalized_ds=normalized_ds,
+            next_normalized_ds=next_normalized_ds,
+            task_s=task_s,
+            task_v=task_v,
+            next_task_v=next_task_v,
+            remaining_t=float(self.horizon),
+            t=0.0,
+            z=jnp.reshape(z, (-1,)),
+        )
+
+        return new_task_state
+    
+
+
+    def step(
+        self, 
+        z_state: MaternTaskState, 
+    ) -> Tuple:
+        """return next state, reward, done, truncation"""
+
+        # check shift
+        current_t = z_state.t + self.dt
+        need_shift = current_t > self.period_t
+
+        shifted_data = (
+            current_t - self.period_t, 
+            z_state.next_normalized_ds, 
+            z_state.next_task_v,
+            jnp.concatenate([z_state.task_s[:, 1:], jnp.zeros((2, 1))], axis=-1), 
+            jnp.concatenate([z_state.next_normalized_ds[:, 1:], jnp.zeros((2, 1))], axis=-1), 
+            jnp.concatenate([z_state.next_task_v[:, 1:], jnp.zeros((2, 1))], axis=-1),
+        )
+        regular_data = (
+            current_t, 
+            z_state.normalized_ds, 
+            z_state.task_v,
+            z_state.task_s, 
+            z_state.next_normalized_ds, 
+            z_state.next_task_v,
+        )
+        (current_t, normalized_ds, task_v, task_s, next_normalized_ds, next_task_v) = jax.lax.cond(
+            need_shift,
+            lambda x: shifted_data,
+            lambda x: regular_data,
+            None,
+        ) # apply changes
+
+        coefs = jnp.concatenate([task_s[:, :2], task_v[:, :2]], axis=-1) @ self.Sigma22_inv_AT # (2, 4)
+        target_position = jnp.sum(coefs * self._base_fn(current_t), axis=-1) # (2,)
+        deviation = target_position
+
+
+        # check task finish
+        new_remaining_t = z_state.remaining_t - self.dt
+        deviation, new_remaining_t, normalized_t = jax.lax.cond(
+            new_remaining_t < 0,
+            lambda x: (jnp.zeros_like(deviation), -1.0, -1.0),
+            lambda x: (deviation, new_remaining_t, 2*new_remaining_t/self.horizon - 1),
+            None,
+        )
+
+        next_task_state = z_state.replace(
+            normalized_ds=normalized_ds,
+            next_normalized_ds=next_normalized_ds,
+            task_s=task_s,
+            task_v=task_v,
+            next_task_v=next_task_v,
+            remaining_t=new_remaining_t,
+            t=current_t,
+        )
+
+        return next_task_state, target_position, normalized_t
+    
+
+
+

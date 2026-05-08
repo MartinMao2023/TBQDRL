@@ -177,6 +177,8 @@ def training_loop(
         final_states,
     )
 
+    new_states = jax.vmap(env.resample_initial_task_state)(new_states)
+
     new_carry = (
         new_states,
         ppo_training_state,

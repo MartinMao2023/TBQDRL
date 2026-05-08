@@ -147,7 +147,7 @@ class FiniteMaternWrapper(BaseQDTaskWrapper):
         # sample way_points data
         mean_ys = self.posterior_mu_T * state_info.current_velocity[:, None] # (2, 2 * waypoints + 1)
         key, subkey = jax.random.split(key)
-        ys = mean_ys + jax.random.normal(subkey, (2, 2 * self.way_points + 1)) @ self.posterior_L # (2, 2 * way_points + 1)
+        ys = mean_ys + jax.random.normal(subkey, (2, 2 * self.way_points + 1)) @ self.posterior_L.T # (2, 2 * way_points + 1)
 
         # sample deviation
         deviation = jnp.zeros((2, 1)) # (2, 1)
