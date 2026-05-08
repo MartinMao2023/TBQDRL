@@ -70,8 +70,6 @@ class QDRolloutMetrics(PyTreeNode):
 class QDTrainingMetrics(PyTreeNode):
     critic_error: float
     fitness_critic_error: float
-    coef: float
-    raw_coef: float
     approx_kl: float
     clip_fraction: float
 
@@ -400,8 +398,6 @@ class QDPPO:
         training_data = QDTrainingMetrics(
             critic_error=final_critic_error,
             fitness_critic_error=final_fitness_error,
-            coef=0.0,
-            raw_coef=0.0,
             approx_kl=final_approx_kl,
             clip_fraction=final_clip_fraction,
             )
@@ -694,12 +690,6 @@ class QDPPO:
         
         gaes = self._process_gaes(td_lambda_returns - v_values)
         fitness_gaes = self._process_gaes(fitness_td_lambda_returns - fitness_v_values)
-        
-        raw_coef = jnp.mean(gaes * fitness_gaes) / (jnp.mean(gaes**2) + 1e-6)
-        coef = jnp.mean(
-            (gaes - jnp.mean(gaes)) * (fitness_gaes - jnp.mean(fitness_gaes))
-        ) / (jnp.var(gaes) + 1e-6)
-
 
         conditioned_gaes = jnp.where(gaes * fitness_gaes > 0, gaes + fitness_gaes, gaes)
         final_gaes = jnp.where(
@@ -735,7 +725,6 @@ class QDPPO:
             transitions)
         
         new_training_state, training_data = self.state_update(training_state, transitions)
-        training_data = training_data.replace(coef=coef, raw_coef=raw_coef)
         aux_data = QDAuxData(rollout_data=rollout_data, training_data=training_data)
 
         return (final_states, sampled_states, new_training_state, step_count, key), aux_data

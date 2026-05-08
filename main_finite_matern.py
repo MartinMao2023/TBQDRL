@@ -22,7 +22,7 @@ from data_struct.states import GeneralizedState
 
 
 vec_env = 4096
-mini_batch_size= 8192
+mini_batch_size = 8192
 num_iterations = 5000
 policy_epochs = 4
 critic_epochs = 4
@@ -149,6 +149,7 @@ states = jax.vmap(env.reset)(subkeys)
 carry = (states, ppo_training_state, jnp.zeros((vec_env,)), loop_random_key)
 
 
+@jax.jit
 def training_loop(
     carry: Tuple[GeneralizedState, QDPPOTrainingState, jax.Array, RNGKey], 
     _: None,
