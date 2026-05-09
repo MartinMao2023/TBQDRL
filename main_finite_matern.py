@@ -23,18 +23,18 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 8192
-num_iterations = 5000
+num_iterations = 10000
 policy_epochs = 4
 critic_epochs = 4
 fitness_critic_epochs = 4
-policy_learning_rate = 3e-4
+policy_learning_rate_per_std = 1e-3 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
 
 description = {
         "task": "LineEncoder test finte matern BRPG",
         "v_max": 3.0,
-        "policy_learning_rate": policy_learning_rate,
+        "policy_learning_rate": policy_learning_rate_per_std,
         "critic_learning_rate": critic_learning_rate,
         "architecture": "Simple MLP for both networks",
         "learnable std": False,
@@ -72,7 +72,7 @@ with open(folder_path + "/description.log", "w") as f:
 
 
 ppo_config = QDPPOConfigs(
-    policy_learnng_rate=policy_learning_rate,
+    policy_learnng_rate_per_std=policy_learning_rate_per_std,
     critic_learning_rate=critic_learning_rate,
     fitness_critic_learning_rate=critic_learning_rate,
     clip_ratio=0.2,
@@ -85,11 +85,6 @@ ppo_config = QDPPOConfigs(
     critic_epochs=critic_epochs,
     policy_epochs=policy_epochs,
     fitness_critic_epochs=fitness_critic_epochs,
-    initial_std=0.5,
-    std_decay_rate=0.0001,
-    min_std=0.1,
-    initial_fitness_weight=0.0,
-    fitness_grow_rate=0.0,
 )
 
 
@@ -136,6 +131,7 @@ ppo = QDPPO(
     critic_network=critic_network,
     fitness_critic_network=fitness_critic_network,
     ppo_configs=ppo_config,
+    std_anneal_fn=lambda x: jnp.maximum(0.05, 0.5 - x * 5e-5),
 )
 
 loop_random_key, subkey = jax.random.split(loop_random_key)

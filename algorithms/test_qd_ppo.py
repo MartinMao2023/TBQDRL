@@ -14,13 +14,12 @@ from data_struct.states import GeneralizedState
 from networks import PPO_Policy
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
-# from trajectory_encoder import TaskEncoder, TaskState
 from task_wrappers.base import BaseQDTaskWrapper
 
 
 @dataclass
 class QDPPOConfigs:
-    policy_learnng_rate: float = 3e-4
+    policy_learnng_rate_per_std: float = 1e-3 # learning_rate per std
     critic_learning_rate: float = 5e-4
     fitness_critic_learning_rate: float = 5e-4 # new
     clip_ratio: float = 0.2
@@ -31,15 +30,10 @@ class QDPPOConfigs:
     vec_env: int = 256
     mini_batch_size: int = 1024
     critic_epochs: int = 4
-    fitness_critic_epochs: int = 4 # new
     policy_epochs: int = 4
+    fitness_critic_epochs: int = 4 # new
 
-    initial_std: float = 0.2
-    std_decay_rate: float = 5e-5
-    min_std: jnp.ndarray = 0.05
 
-    initial_fitness_weight: float = 0.0
-    fitness_grow_rate: float = 2e-4
 
 
 
@@ -54,8 +48,8 @@ class  QDPPOTrainingState(PyTreeNode):
     critic_opt_state: optax.OptState
     fitness_critic_opt_state: optax.OptState
 
-    current_std: jnp.ndarray
-    fitness_weight: float
+    current_std: jax.Array
+    step_num: int
 
 
 
@@ -91,10 +85,12 @@ class QDPPO:
         critic_network: nn.Module,
         fitness_critic_network: nn.Module,
         ppo_configs: QDPPOConfigs,
+        std_anneal_fn: Callable,
         ):
 
         self._env = env
         self.configs = ppo_configs
+        self._std_anneal_fn = std_anneal_fn
 
         self.mini_batch_num = (
             ppo_configs.vec_env * ppo_configs.rollout_length
@@ -104,6 +100,7 @@ class QDPPO:
         self._policy_network = policy_network
         self._critic_network = critic_network
         self._fitness_critic_network = fitness_critic_network
+        self._lr_per_std = ppo_configs.policy_learnng_rate_per_std
 
         if ppo_configs.clip_ratio > 0:
             self._clip_log_ratio = jnp.log(1 + ppo_configs.clip_ratio)
@@ -114,18 +111,11 @@ class QDPPO:
         def make_ppo_optimizer(learning_rate):
             return optax.adam(learning_rate=learning_rate)
         
+        initial_std = std_anneal_fn(0)
+        rms_std = jnp.sqrt(jnp.mean(initial_std**2))
         self._policy_optimizer = optax.inject_hyperparams(make_ppo_optimizer)(
-            learning_rate=ppo_configs.initial_std * 1e-3)
+            learning_rate=rms_std * self._lr_per_std)
 
-        # self._policy_optimizer = optax.inject_hyperparams(optax.chain)(
-        #     optax.clip_by_global_norm(0.5), 
-        #     optax.adam,
-        #     learning_rate=ppo_configs.initial_std * 1e-3
-        # )
-
-        # self._policy_optimizer = optax.adam(
-        #     learning_rate=ppo_configs.policy_learnng_rate,
-        # )
 
         self._critic_optimizer = optax.adam(
             learning_rate=ppo_configs.critic_learning_rate,
@@ -146,7 +136,7 @@ class QDPPO:
             starting_states: GeneralizedState,
             step_count: jax.Array,
             keys: RNGKey,
-            std: jnp.ndarray,
+            std: jax.Array,
             ) -> Tuple[GeneralizedState, QDPPOTransition]:
 
             def play_step_fn(
@@ -207,8 +197,7 @@ class QDPPO:
             )
 
             final_states, sampled_states, step_count, _ = final_carry
-            # final_obs, final_zs = self._env.get_obs(final_states)
-            # return final_obs, final_zs, sampled_states, transitions
+
             return final_states, sampled_states, step_count, transitions
         
         self._rollout_fn = rollout_fn
@@ -239,7 +228,6 @@ class QDPPO:
         ) -> float:
             
             estimated_v = fitness_critic_network.apply(fitness_critic_params, transitions.obs, transitions.zs)
-            # weights = jnp.clip(1 / (17 * transitions.weights**2 + 16 - 32*transitions.weights), max=1.0)
             weights = 1 / (1 + jnp.square(transitions.weights))
             loss = jnp.average(
                 jnp.square(estimated_v - transitions.fitness_td_lambda_returns), 
@@ -323,6 +311,8 @@ class QDPPO:
         fitness_critic_params = self._fitness_critic_network.init(subkey, obs=fake_obs, z=fake_zs)
         fitness_critic_opt_state = self._fitness_critic_optimizer.init(fitness_critic_params)
 
+        initial_std = self._std_anneal_fn(0)
+
         
         training_state = QDPPOTrainingState(
             policy_params=policy_params,
@@ -331,8 +321,8 @@ class QDPPO:
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
             fitness_critic_opt_state=fitness_critic_opt_state,
-            current_std=jnp.array(self.configs.initial_std),
-            fitness_weight=self.configs.initial_fitness_weight,
+            current_std=jnp.array(initial_std),
+            step_num=0,
             )
 
         return training_state
@@ -368,22 +358,20 @@ class QDPPO:
                 self.train_policy, 
                 transitions=transitions, 
                 std=training_state.current_std,
-                fitness_weight=training_state.fitness_weight,
                 )(x),
             (training_state.policy_params, training_state.policy_opt_state, 0.0, 0.0),
             length=self.configs.policy_epochs,
         )
 
         # annealing
-        current_std = jnp.maximum(
-            self.configs.min_std, 
-            training_state.current_std - self.configs.std_decay_rate
-        )
-        current_learning_rate = jnp.maximum(1e-4, current_std * 1e-3)
+        step_num = training_state.step_num + 1
+        current_std = self._std_anneal_fn(step_num)
+        rms_std = jnp.sqrt(jnp.mean(current_std**2))
+
+        current_learning_rate = rms_std * self._lr_per_std
         policy_opt_state = policy_opt_state._replace(
             hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
         )
-        current_fitness_weight = training_state.fitness_weight + self.configs.fitness_grow_rate
         
         new_training_state = QDPPOTrainingState(
             policy_params=policy_params,
@@ -393,7 +381,7 @@ class QDPPO:
             critic_opt_state=critic_opt_state,
             fitness_critic_opt_state=fitness_critic_opt_state,
             current_std=current_std,
-            fitness_weight=jnp.clip(current_fitness_weight, max=1.0),
+            step_num=step_num,
         )
         training_data = QDTrainingMetrics(
             critic_error=final_critic_error,
@@ -414,7 +402,6 @@ class QDPPO:
         carry: Tuple[Params, optax.OptState, float, float],
         transitions: QDPPOTransition,
         std: jnp.ndarray,
-        fitness_weight: float,
         ) -> Tuple[Tuple[Params, optax.OptState, float, float], Any]:
         """
         perform one epoch training of policy network
@@ -452,7 +439,6 @@ class QDPPO:
         
         def cond_scan_train_policy(carry, transition_data):
             approx_kl = carry[-2]
-            # clip_fraction = carry[-1]
             new_carry = jax.lax.cond(
                 # clip_fraction > 0.1,
                 approx_kl > 0.0125,
