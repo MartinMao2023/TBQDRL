@@ -813,7 +813,7 @@ class QDPPO:
             average_return=jnp.mean(v_values),
             # average_return=jnp.mean(initial_v_value),
             average_fitness=jnp.mean(fitnesses),
-            average_lifespan=jnp.mean(lifespans),
+            average_lifespan=jnp.mean(initial_lifespan),
             )
         
         return rollout_data

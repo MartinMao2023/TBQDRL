@@ -59,10 +59,14 @@ class GCMLP(nn.Module):
     final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None
     bias: bool = True
     kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
-        hidden = jnp.concatenate([obs, z], axis=-1)
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
 
         for i, hidden_size in enumerate(self.layer_sizes):
 
@@ -332,13 +336,18 @@ class GC_PPO_Policy(nn.Module):
     learnable_std: bool = False
     activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
     kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
-    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = nn.tanh
     bias: bool = True
     kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
-        hidden = jnp.concatenate([obs, z], axis=-1)
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
         for hidden_size in self.hidden_layer_sizes:
             hidden = nn.Dense(
                 hidden_size,
@@ -374,6 +383,51 @@ class GC_PPO_Policy(nn.Module):
                 (self.action_dim,)
             )
         return action_mean, std_logits
+    
+
+
+class GC_BinaryPPO_Policy(nn.Module):
+    """
+    Goal-conditioned binary PPO policy module.
+    """
+
+    hidden_layer_sizes: Tuple[int, ...]
+    action_dim: int
+    initial_std: jnp.ndarray
+    learnable_std: bool = False
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
+        for hidden_size in self.hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        action_logits = nn.Dense(
+            self.action_dim,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(hidden)
+
+        return action_logits
 
 
 
