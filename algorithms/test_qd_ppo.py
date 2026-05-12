@@ -86,11 +86,13 @@ class QDPPO:
         fitness_critic_network: nn.Module,
         ppo_configs: QDPPOConfigs,
         std_anneal_fn: Callable,
+        r_annealing_fn: Callable,
         ):
 
         self._env = env
         self.configs = ppo_configs
         self._std_anneal_fn = std_anneal_fn
+        self._r_annealing_fn = r_annealing_fn
 
         self.mini_batch_num = (
             ppo_configs.vec_env * ppo_configs.rollout_length
@@ -137,6 +139,7 @@ class QDPPO:
             step_count: jax.Array,
             keys: RNGKey,
             std: jax.Array,
+            inv_r: jax.Array,
             ) -> Tuple[GeneralizedState, QDPPOTransition]:
 
             def play_step_fn(
@@ -156,12 +159,12 @@ class QDPPO:
                     keepdims=True,
                     ) # shape of (1,)
                 
-                fitness_gaes = jnp.where(
+                conditioned = jnp.where(
                     state.z_state.remaining_t > 0,
-                    jnp.zeros((1,)),
-                    jnp.ones((1,))) # <----  we use this to indicate if the task has finished
+                    jnp.ones((1,)),
+                    jnp.zeros((1,))) # <----  we use this to indicate if the task has finished
                 
-                state, transition_info = env.step(state, action)
+                state, transition_info = env.step(state, action, inv_r)
                 l = l + 1 - state.env_state.done * l
 
                 key, subkey = jax.random.split(key)
@@ -182,7 +185,7 @@ class QDPPO:
                     td_lambda_returns=jnp.zeros((1,)),
                     fitness_td_lambda_returns=jnp.zeros((1,)),
                     gaes=jnp.zeros((1,)),
-                    fitness_gaes=fitness_gaes,
+                    conditioned=conditioned,
                     dones=transition_info.done,
                     truncations=transition_info.truncation,
                     weights=jnp.zeros((1,)),
@@ -646,6 +649,7 @@ class QDPPO:
                 step_count,
                 subkeys, 
                 training_state.current_std,
+                1 / self._r_annealing_fn(training_state.step_num)
                 )
         final_obs, final_zs = self._env.get_obs(final_states)
 
@@ -679,9 +683,9 @@ class QDPPO:
 
         conditioned_gaes = jnp.where(gaes * fitness_gaes > 0, gaes + fitness_gaes, gaes)
         final_gaes = jnp.where(
-            transitions.fitness_gaes > 0.5, # if task complete
-            gaes + fitness_gaes,
+            transitions.conditioned > 0.5, # if conditioned
             conditioned_gaes,
+            gaes + fitness_gaes,
         )
 
         transitions = transitions.replace(

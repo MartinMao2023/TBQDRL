@@ -84,7 +84,8 @@ class BaseQDTaskWrapper(BaseTaskWrapper, abc.ABC):
     def step(
         self, 
         state: GeneralizedState, 
-        action: jax.Array,    
+        action: jax.Array,
+        inv_r: jax.Array = 1.0, # inverse of radius (array)
     ) -> Tuple[GeneralizedState, QDTransitionInfo]:
         """return next state, and transition information"""
         pass

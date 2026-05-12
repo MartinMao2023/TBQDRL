@@ -37,7 +37,7 @@ class QDPPOTransition(flax.struct.PyTreeNode):
     td_lambda_returns: jnp.ndarray
     fitness_td_lambda_returns: jnp.ndarray
     gaes: jnp.ndarray
-    fitness_gaes: jnp.ndarray
+    conditioned: jnp.ndarray # If require conditioned optimization
     dones: Done
     truncations: jnp.ndarray  # Indicates if an episode has reached max time step
     weights: jnp.ndarray  # weight resulting from truncation 
@@ -95,7 +95,7 @@ class QDPPOTransition(flax.struct.PyTreeNode):
                 self.td_lambda_returns,
                 self.fitness_td_lambda_returns,
                 self.gaes,
-                self.fitness_gaes,
+                self.conditioned,
                 self.dones,
                 self.truncations,
                 self.weights,
@@ -143,7 +143,7 @@ class QDPPOTransition(flax.struct.PyTreeNode):
                                                          obs_dim + action_dim + task_dim + 5]
         gaes = flattened_transition[:, obs_dim + action_dim + task_dim + 5: 
                                     obs_dim + action_dim + task_dim + 6]
-        fitness_gaes = flattened_transition[:, -4: -3]
+        conditioned = flattened_transition[:, -4: -3]
         dones = flattened_transition[:, -3: -2]
         truncations = flattened_transition[:, -2 : -1]
         weights = flattened_transition[:, -1:]
@@ -159,7 +159,7 @@ class QDPPOTransition(flax.struct.PyTreeNode):
             td_lambda_returns=td_lambda_returns,
             fitness_td_lambda_returns=fitness_td_lambda_returns,
             gaes=gaes,
-            fitness_gaes=fitness_gaes,
+            conditioned=conditioned,
             dones=dones,
             truncations=truncations,
             weights=weights,
@@ -189,7 +189,7 @@ class QDPPOTransition(flax.struct.PyTreeNode):
             td_lambda_returns=jnp.zeros(shape=(1, 1)),
             fitness_td_lambda_returns=jnp.zeros(shape=(1, 1)),
             gaes=jnp.zeros(shape=(1, 1)),
-            fitness_gaes=jnp.zeros(shape=(1, 1)),
+            conditioned=jnp.zeros(shape=(1, 1)),
             dones=jnp.zeros(shape=(1, 1)),
             truncations=jnp.zeros(shape=(1, 1)),
             weights=jnp.zeros(shape=(1, 1)),

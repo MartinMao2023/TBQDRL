@@ -88,13 +88,13 @@ ppo_config = QDPPOConfigs(
 )
 
 
-seed = 4242
+seed = 8848
 # seed = 42
 loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
-env = FiniteMaternWrapper(env, var=2.25)
+env = FiniteMaternWrapper(env, var=2.25, horizon=8, way_points=16) # for horizon = 8
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (64, 64)
@@ -132,12 +132,14 @@ ppo = QDPPO(
     fitness_critic_network=fitness_critic_network,
     ppo_configs=ppo_config,
     std_anneal_fn=lambda x: jnp.maximum(0.05, 0.5 - x * 5e-5),
+    # r_annealing_fn=lambda x: jnp.maximum(0.5, 1.0 - x * 1e-4),
+    r_annealing_fn=lambda x: 0.5,
 )
 
 loop_random_key, subkey = jax.random.split(loop_random_key)
 ppo_training_state = ppo.init(subkey)
 
-seed = 4242
+seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
@@ -166,7 +168,8 @@ def training_loop(
     restarted_states = jax.vmap(env.resample_task_state)(sampled_states)
     
     loop_random_key, subkey = jax.random.split(loop_random_key)
-    ps = jax.random.bernoulli(subkey, p=0.5, shape=(vec_env,)) & (step_count > 94)
+    # ps = jax.random.bernoulli(subkey, p=0.5, shape=(vec_env,)) & (step_count > 94) # for horizon = 4
+    ps = jax.random.bernoulli(subkey, p=0.5, shape=(vec_env,)) & (step_count > 190) # for horizon = 8
 
     new_states = jax.tree.map(
         lambda a, b: jax.vmap(jax.lax.select)(ps, a, b),
