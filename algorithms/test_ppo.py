@@ -6,22 +6,22 @@ from typing import Any, Tuple, Callable
 import flax.linen as nn
 import jax
 import optax
-from optax.losses import sigmoid_binary_cross_entropy
+# from optax.losses import sigmoid_binary_cross_entropy
 from jax import numpy as jnp
 
-from data_struct import QDPPOTransition
+from data_struct import PPOTransition
 from data_struct.states import GeneralizedState
 from networks import PPO_Policy
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
-from task_wrappers.base import BaseQDTaskWrapper
+from task_wrappers.base import BaseTaskWrapper
+
 
 
 @dataclass
-class QDPPOConfigs:
+class PPOConfigs:
     policy_learnng_rate_per_std: float = 1e-3 # learning_rate per std
     critic_learning_rate: float = 5e-4
-    fitness_critic_learning_rate: float = 5e-4 # new
     clip_ratio: float = 0.2
     entropy_gain: float = 0.01
     discount: float = 0.99
@@ -31,68 +31,58 @@ class QDPPOConfigs:
     mini_batch_size: int = 1024
     critic_epochs: int = 4
     policy_epochs: int = 4
-    fitness_critic_epochs: int = 4 # new
 
 
 
 
-
-class  QDPPOTrainingState(PyTreeNode):
+class  PPOTrainingState(PyTreeNode):
     """Contains training state for the learner."""
 
     policy_params: Params
     critic_params: Params
-    fitness_critic_params: Params
 
     policy_opt_state: optax.OptState
     critic_opt_state: optax.OptState
-    fitness_critic_opt_state: optax.OptState
 
     current_std: jax.Array
     step_num: int
 
 
 
-class QDRolloutMetrics(PyTreeNode):
+class RolloutMetrics(PyTreeNode):
     average_reward: float
-    average_fitness_reward: float
     average_return: float
-    average_fitness: float
     average_lifespan: float
 
 
-class QDTrainingMetrics(PyTreeNode):
+class TrainingMetrics(PyTreeNode):
     critic_error: float
-    fitness_critic_error: float
     approx_kl: float
     clip_fraction: float
 
 
-class QDAuxData(PyTreeNode):
+class AuxData(PyTreeNode):
     """Contains auxiliary information for monitoring"""
 
-    rollout_data: QDRolloutMetrics
-    training_data: QDTrainingMetrics
+    rollout_data: RolloutMetrics
+    training_data: TrainingMetrics
     
 
 
 
-class QDPPO:
+class PPO:
     def __init__(
         self,
-        env: BaseQDTaskWrapper,
+        env: BaseTaskWrapper,
         policy_network: PPO_Policy,
         critic_network: nn.Module,
-        fitness_critic_network: nn.Module,
-        ppo_configs: QDPPOConfigs,
+        ppo_configs: PPOConfigs,
         std_anneal_fn: Callable,
-        r_annealing_fn: Callable,
         ):
 
         self._env = env
         self.configs = ppo_configs
         self._std_anneal_fn = std_anneal_fn
-        self._r_annealing_fn = r_annealing_fn
 
         self.mini_batch_num = (
             ppo_configs.vec_env * ppo_configs.rollout_length
@@ -101,7 +91,6 @@ class QDPPO:
 
         self._policy_network = policy_network
         self._critic_network = critic_network
-        self._fitness_critic_network = fitness_critic_network
         self._lr_per_std = ppo_configs.policy_learnng_rate_per_std
 
         if ppo_configs.clip_ratio > 0:
@@ -109,21 +98,16 @@ class QDPPO:
         else:
             raise(ValueError("invalid clip ratio"))
 
-
         def make_ppo_optimizer(learning_rate):
             return optax.adam(learning_rate=learning_rate)
         
         initial_std = std_anneal_fn(0)
         rms_std = jnp.sqrt(jnp.mean(initial_std**2))
+
         self._policy_optimizer = optax.inject_hyperparams(make_ppo_optimizer)(
             learning_rate=rms_std * self._lr_per_std)
-
-
         self._critic_optimizer = optax.adam(
             learning_rate=ppo_configs.critic_learning_rate,
-        )
-        self._fitness_critic_optimizer = optax.adam(
-            learning_rate=ppo_configs.fitness_critic_learning_rate,
         )
 
         if policy_network.learnable_std:
@@ -136,15 +120,13 @@ class QDPPO:
         def rollout_fn(
             policy_params: Params,
             starting_states: GeneralizedState,
-            step_count: jax.Array,
             keys: RNGKey,
             std: jax.Array,
-            inv_r: jax.Array,
-            ) -> Tuple[GeneralizedState, QDPPOTransition]:
+            ) -> Tuple[GeneralizedState, PPOTransition]:
 
             def play_step_fn(
                 carry: Tuple[GeneralizedState, GeneralizedState, float, RNGKey],
-                ) -> Tuple[Tuple, QDPPOTransition]:
+                ) -> Tuple[Tuple, PPOTransition]:
                 
                 state, sampled_state, l, key = carry
                 obs, z = env.get_obs(state)
@@ -159,12 +141,7 @@ class QDPPO:
                     keepdims=True,
                     ) # shape of (1,)
                 
-                conditioned = jnp.where(
-                    state.z_state.remaining_t > 0,
-                    jnp.ones((1,)),
-                    jnp.zeros((1,))) # <----  we use this to indicate if the task has finished
-                
-                state, transition_info = env.step(state, action, inv_r)
+                state, transition_info = env.step(state, action)
                 l = l + 1 - state.env_state.done * l
 
                 key, subkey = jax.random.split(key)
@@ -175,17 +152,14 @@ class QDPPO:
                     sampled_state
                 )
 
-                transition = QDPPOTransition(
+                transition = PPOTransition(
                     obs=obs,
                     actions=action,
                     zs=z, 
                     log_likelihood=log_likelihood,
                     rewards=transition_info.reward,
-                    fitness_rewards=transition_info.fitness_reward,
                     td_lambda_returns=jnp.zeros((1,)),
-                    fitness_td_lambda_returns=jnp.zeros((1,)),
                     gaes=jnp.zeros((1,)),
-                    conditioned=conditioned,
                     dones=transition_info.done,
                     truncations=transition_info.truncation,
                     weights=jnp.zeros((1,)),
@@ -195,57 +169,38 @@ class QDPPO:
 
             final_carry, transitions = jax.lax.scan(
                 lambda x, _: jax.vmap(play_step_fn)(x),
-                (starting_states, starting_states, step_count, keys),
+                (starting_states, starting_states, jnp.zeros((ppo_configs.vec_env,)), keys),
                 length=ppo_configs.rollout_length,
             )
 
-            final_states, sampled_states, step_count, _ = final_carry
+            final_states, sampled_states = final_carry[:2]
 
-            return final_states, sampled_states, step_count, transitions
+            return final_states, sampled_states, transitions
         
         self._rollout_fn = rollout_fn
 
-
+        
         def critic_loss_fn(
             critic_params: Params,
-            transitions: QDPPOTransition,
+            transitions: PPOTransition,
         ) -> float:
-
+            
             estimated_v = critic_network.apply(critic_params, transitions.obs, transitions.zs)
             weights = 1 / (1 + jnp.square(transitions.weights))
-            loss = jnp.mean(sigmoid_binary_cross_entropy(
-                estimated_v, transitions.td_lambda_returns
-                ) * weights)
-            rms_error = jnp.sqrt(
-                jnp.average(
-                    jnp.square(nn.sigmoid(estimated_v) - transitions.td_lambda_returns), 
-                    weights=weights,
-                    )
-                )
-            
-            return loss, rms_error
-        
-        def fitness_critic_loss_fn(
-            fitness_critic_params: Params,
-            transitions: QDPPOTransition,
-        ) -> float:
-            
-            estimated_v = fitness_critic_network.apply(fitness_critic_params, transitions.obs, transitions.zs)
-            weights = 1 / (1 + jnp.square(transitions.weights))
             loss = jnp.average(
-                jnp.square(estimated_v - transitions.fitness_td_lambda_returns), 
+                jnp.square(estimated_v - transitions.td_lambda_returns), 
                 weights=weights)
                         
             return loss, jnp.sqrt(loss)
 
-        
+
         self._critic_loss_fn = critic_loss_fn
-        self._fitness_critic_loss_fn = fitness_critic_loss_fn
+
 
         if policy_network.learnable_std:
             def policy_loss_fn(
                 policy_params: Params,
-                transitions: QDPPOTransition,
+                transitions: PPOTransition,
                 std: jnp.ndarray,
             ) -> float:
 
@@ -270,7 +225,7 @@ class QDPPO:
         else:
             def policy_loss_fn(
                 policy_params: Params,
-                transitions: QDPPOTransition,
+                transitions: PPOTransition,
                 std: jnp.ndarray,
             ) -> float:
                 
@@ -297,7 +252,7 @@ class QDPPO:
     def init(
         self, 
         key: RNGKey,
-    ) -> QDPPOTrainingState:
+    ) -> PPOTrainingState:
         
         fake_obs = jnp.zeros(shape=(self._env.observation_size,))
         fake_zs = jnp.zeros(shape=(self._env.z_size,))
@@ -310,20 +265,15 @@ class QDPPO:
         critic_params = self._critic_network.init(subkey, obs=fake_obs, z=fake_zs)
         critic_opt_state = self._critic_optimizer.init(critic_params)
 
-        key, subkey = jax.random.split(key)
-        fitness_critic_params = self._fitness_critic_network.init(subkey, obs=fake_obs, z=fake_zs)
-        fitness_critic_opt_state = self._fitness_critic_optimizer.init(fitness_critic_params)
 
         initial_std = self._std_anneal_fn(0)
 
         
-        training_state = QDPPOTrainingState(
+        training_state = PPOTrainingState(
             policy_params=policy_params,
             critic_params=critic_params,
-            fitness_critic_params=fitness_critic_params,
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
-            fitness_critic_opt_state=fitness_critic_opt_state,
             current_std=jnp.array(initial_std),
             step_num=0,
             )
@@ -337,9 +287,9 @@ class QDPPO:
     )
     def state_update(
         self, 
-        training_state: QDPPOTrainingState, 
-        transitions: QDPPOTransition, 
-    ) -> Tuple[QDPPOTrainingState, QDTrainingMetrics]:
+        training_state: PPOTrainingState, 
+        transitions: PPOTransition, 
+    ) -> Tuple[PPOTrainingState, TrainingMetrics]:
         """
         This function can now be Jit-complied.
         """
@@ -348,12 +298,6 @@ class QDPPO:
             lambda x, _: partial(self.train_critic, transitions=transitions)(x),
             (training_state.critic_params, training_state.critic_opt_state, 0.0),
             length=self.configs.critic_epochs,
-        )
-
-        (fitness_critic_params, fitness_critic_opt_state, final_fitness_error), _ = jax.lax.scan(
-            lambda x, _: partial(self.train_fitness_critic, transitions=transitions)(x),
-            (training_state.fitness_critic_params, training_state.fitness_critic_opt_state, 0.0),
-            length=self.configs.fitness_critic_epochs,
         )
 
         (policy_params, policy_opt_state, final_approx_kl, final_clip_fraction), _ = jax.lax.scan(
@@ -376,19 +320,16 @@ class QDPPO:
             hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
         )
         
-        new_training_state = QDPPOTrainingState(
+        new_training_state = PPOTrainingState(
             policy_params=policy_params,
             critic_params=critic_params,
-            fitness_critic_params=fitness_critic_params,
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
-            fitness_critic_opt_state=fitness_critic_opt_state,
             current_std=current_std,
             step_num=step_num,
         )
-        training_data = QDTrainingMetrics(
+        training_data = TrainingMetrics(
             critic_error=final_critic_error,
-            fitness_critic_error=final_fitness_error,
             approx_kl=final_approx_kl,
             clip_fraction=final_clip_fraction,
             )
@@ -403,7 +344,7 @@ class QDPPO:
     def train_policy(
         self,
         carry: Tuple[Params, optax.OptState, float, float],
-        transitions: QDPPOTransition,
+        transitions: PPOTransition,
         std: jnp.ndarray,
         ) -> Tuple[Tuple[Params, optax.OptState, float, float], Any]:
         """
@@ -467,7 +408,7 @@ class QDPPO:
     def train_critic(
         self,
         carry: Tuple[Params, optax.OptState, float],
-        transitions: QDPPOTransition,
+        transitions: PPOTransition,
     ) -> Tuple[Tuple[Params, optax.OptState, float], Any]:
         """
         perform one epoch training of critic network
@@ -506,95 +447,25 @@ class QDPPO:
         jax.jit, 
         static_argnames=("self",)
     )
-    def train_fitness_critic(
-        self,
-        carry: Tuple[Params, optax.OptState, float],
-        transitions: QDPPOTransition,
-    ) -> Tuple[Tuple[Params, optax.OptState, float], Any]:
-        """
-        perform one epoch training of fitness critic network
-        """
-        
-        def scan_train_critic(carry, transition_data):
-            (
-                current_critic_params, 
-                current_critic_opt_state, 
-                current_critic_error,
-                ) = carry
-
-            critic_gradient, critic_error = jax.grad(self._fitness_critic_loss_fn, has_aux=True)(
-                current_critic_params,
-                transition_data,
-                )
-            
-            new_critic_error = critic_error * (1 - self.ema_alpha) + self.ema_alpha * current_critic_error
-            
-            critic_updates, new_critic_opt_state = self._fitness_critic_optimizer.update(
-                critic_gradient, current_critic_opt_state)
-            new_critic_params = optax.apply_updates(current_critic_params, critic_updates)
-            
-            return (new_critic_params, new_critic_opt_state, new_critic_error), None
-        
-        final_carry, _ = jax.lax.scan(
-            scan_train_critic,
-            carry,
-            transitions,
-        )
-        
-        return final_carry, None
-
-
-    @partial(
-        jax.jit, 
-        static_argnames=("self",)
-    )
     def calculate_v(
         self,
         critic_params: Params, 
-        transitions: QDPPOTransition,
+        transitions: PPOTransition,
     ) -> jnp.ndarray:
         
         def scan_calculate_v(
-            transition: QDPPOTransition,
+            transition: PPOTransition,
         ) -> Tuple[None, jnp.ndarray]:
             
             v_value = self._critic_network.apply(
                 critic_params, transition.obs, transition.zs
                 )
-            return None, nn.sigmoid(v_value)
+            return None, v_value
 
         _, v_values = jax.lax.scan(
             lambda _, x: jax.vmap(scan_calculate_v)(x),
             None,
-            transitions,   
-            )
-        
-        return v_values
-    
-
-    @partial(
-        jax.jit, 
-        static_argnames=("self",)
-    )
-    def calculate_fitness_v(
-        self,
-        fitness_critic_params: Params, 
-        transitions: QDPPOTransition,
-    ) -> jnp.ndarray:
-        
-        def scan_calculate_fitness_v(
-            transition: QDPPOTransition,
-        ) -> Tuple[None, jnp.ndarray]:
-            
-            v_value = self._fitness_critic_network.apply(
-                fitness_critic_params, transition.obs, transition.zs
-                )
-            return None, v_value
-
-        _, v_values = jax.lax.scan(
-            lambda _, x: jax.vmap(scan_calculate_fitness_v)(x),
-            None,
-            transitions,   
+            transitions,
             )
         
         return v_values
@@ -630,10 +501,9 @@ class QDPPO:
     def train(
         self,
         starting_states: GeneralizedState,
-        training_state: QDPPOTrainingState,
-        step_count: jax.Array,
+        training_state: PPOTrainingState,
         key: RNGKey,
-    ) -> Tuple[Tuple[GeneralizedState, QDPPOTrainingState, jax.Array, RNGKey], QDAuxData]:
+    ) -> Tuple[Tuple[GeneralizedState, PPOTrainingState, jax.Array, RNGKey], AuxData]:
         """
         Perform one iteration of PPO update
         
@@ -642,62 +512,35 @@ class QDPPO:
         key, subkey = jax.random.split(key)
         subkeys = jax.random.split(subkey, num=self.configs.vec_env)
         (
-            final_states, sampled_states, step_count, transitions
+            final_states, sampled_states, transitions
             ) = self._rollout_fn(
                 training_state.policy_params, 
                 starting_states, 
-                step_count,
                 subkeys, 
                 training_state.current_std,
-                1 / self._r_annealing_fn(training_state.step_num)
                 )
         final_obs, final_zs = self._env.get_obs(final_states)
 
-        final_v = nn.sigmoid(
-            self._critic_network.apply(training_state.critic_params, final_obs, final_zs)
-            )
-        final_fitness_v = self._fitness_critic_network.apply(
-            training_state.fitness_critic_params, final_obs, final_zs
-            )
+        final_v = self._critic_network.apply(training_state.critic_params, final_obs, final_zs)
         v_values = self.calculate_v(training_state.critic_params, transitions)
-        fitness_v_values = self.calculate_fitness_v(training_state.fitness_critic_params, transitions)
 
         td_lambda_returns, weights = self.calculate_td_lambda_returns(
             final_v,
             v_values, 
-            transitions.rewards * (1 - self.configs.discount),
-            transitions.dones,
-            transitions.truncations,
-            ) # rollout x parallelize
-        
-        fitness_td_lambda_returns, _ = self.calculate_td_lambda_returns(
-            final_fitness_v,
-            fitness_v_values, 
-            transitions.fitness_rewards,
+            transitions.rewards,
             transitions.dones,
             transitions.truncations,
             ) # rollout x parallelize
         
         gaes = self._process_gaes(td_lambda_returns - v_values)
-        fitness_gaes = self._process_gaes(fitness_td_lambda_returns - fitness_v_values)
-
-        conditioned_gaes = jnp.where(gaes * fitness_gaes > 0, gaes + fitness_gaes, gaes)
-        final_gaes = jnp.where(
-            transitions.conditioned > 0.5, # if conditioned
-            conditioned_gaes,
-            gaes + fitness_gaes,
-        )
 
         transitions = transitions.replace(
             td_lambda_returns=td_lambda_returns,
-            fitness_td_lambda_returns=fitness_td_lambda_returns,
-            gaes=final_gaes,
-            fitness_gaes=fitness_gaes,
+            gaes=gaes,
             weights=weights,
             )
         rollout_data = self.evaluate_rollout(
             final_v,
-            final_fitness_v,
             transitions,
         )
         
@@ -715,9 +558,9 @@ class QDPPO:
             transitions)
         
         new_training_state, training_data = self.state_update(training_state, transitions)
-        aux_data = QDAuxData(rollout_data=rollout_data, training_data=training_data)
+        aux_data = AuxData(rollout_data=rollout_data, training_data=training_data)
 
-        return (final_states, sampled_states, new_training_state, step_count, key), aux_data
+        return (final_states, sampled_states, new_training_state, key), aux_data
 
 
 
@@ -749,10 +592,9 @@ class QDPPO:
                 )
             current_td_lambda_value = jnp.where(truncate, v_value, current_td_lambda_value)
             weight = jnp.where(
-                truncate > 0.9, 
+                truncate > 0.5, 
                 1.0, 
                 (1 - done) * discount * (1 + (last_weight - 1) * td_lambda_discount)
-                # discount * td_lambda_discount * (last_weight - 1) * (1 - done) + 1
                 )
             
             return (current_td_lambda_value, v_value, weight), (current_td_lambda_value, weight)
@@ -774,45 +616,38 @@ class QDPPO:
     )
     def evaluate_rollout(
         self,
-        final_v: jnp.ndarray,
-        final_fitness_v: jnp.ndarray,
-        transitions: QDPPOTransition,
-        ) -> QDRolloutMetrics:
+        final_v: jax.Array,
+        transitions: PPOTransition,
+        ) -> RolloutMetrics:
 
         discount = self.configs.discount
         average_reward = jnp.mean(transitions.rewards)
-        average_fitness_reward = jnp.mean(transitions.fitness_rewards)
 
         def scan_evaluation(
-            carry: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], 
-            data: QDPPOTransition,
+            carry: Tuple[jax.Array, jax.Array], 
+            data: PPOTransition,
             ) -> Tuple:
 
-            (v_value, fitness, lifespan) = carry
-            new_v_value = (1 - discount) * data.rewards + (1 - data.dones) * discount * v_value
+            (v_value, lifespan) = carry
+            new_v_value = data.rewards + (1 - data.dones) * discount * v_value
             new_v_value = jnp.where(data.truncations, data.td_lambda_returns, new_v_value)
-            new_fitness = data.fitness_rewards + (1 - data.dones) * discount * fitness
-            new_fitness = jnp.where(data.truncations, data.fitness_td_lambda_returns, new_fitness)
             new_lifespan = 1 + (1 - data.dones) * lifespan
 
-            new_carry = (new_v_value, new_fitness, new_lifespan)
+            new_carry = (new_v_value, new_lifespan)
 
             return new_carry, new_carry
         
         (
-            initial_v_value, initial_fitness, initial_lifespan
-            ), (v_values, fitnesses, lifespans) = jax.lax.scan(
+            initial_v_value, initial_lifespan
+            ), (v_values, lifespans) = jax.lax.scan(
             scan_evaluation,
-            (final_v, final_fitness_v, jnp.zeros_like(final_v)),
+            (final_v, jnp.zeros_like(final_v)),
             transitions,
             reverse=True,
         )
-        rollout_data = QDRolloutMetrics(
+        rollout_data = RolloutMetrics(
             average_reward=average_reward,
-            average_fitness_reward=average_fitness_reward,
             average_return=jnp.mean(v_values),
-            # average_return=jnp.mean(initial_v_value),
-            average_fitness=jnp.mean(fitnesses),
             average_lifespan=jnp.mean(lifespans),
             )
         

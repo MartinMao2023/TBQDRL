@@ -46,7 +46,13 @@ class BaseTaskWrapper(Wrapper, abc.ABC):
         env_state = self.env.reset(env_key)
         initial_state_info = self._extract_state_info_for_task(env_state)
         z_state = self._init_task_state(initial_state_info, task_key)
-        state = GeneralizedState(env_state=env_state, z_state=z_state, initial_z_state=z_state, initial_state_info=initial_state_info, key=key)
+        state = GeneralizedState(
+            env_state=env_state, 
+            z_state=z_state, 
+            initial_z_state=z_state, 
+            initial_state_info=initial_state_info, 
+            key=key,
+            )
         return state
     
 

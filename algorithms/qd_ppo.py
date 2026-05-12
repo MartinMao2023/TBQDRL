@@ -749,7 +749,7 @@ class QDPPO:
                 )
             current_td_lambda_value = jnp.where(truncate, v_value, current_td_lambda_value)
             weight = jnp.where(
-                truncate > 0.9, 
+                truncate > 0.5, 
                 1.0, 
                 (1 - done) * discount * (1 + (last_weight - 1) * td_lambda_discount)
                 # discount * td_lambda_discount * (last_weight - 1) * (1 - done) + 1
