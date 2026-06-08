@@ -1,4 +1,5 @@
 import jax
+# jax.config.update("jax_debug_nans", True)
 import flax.linen as nn
 import jax.numpy as jnp
 # from wrappers import AutoResetWrapper
@@ -17,18 +18,19 @@ from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
 from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
 # from functools import partial
 from flax import serialization
-from task_wrappers.ant_wrapper import AntWrapper
+from task_wrappers.go2_wrapper import Go2Wrapper
 from data_struct.states import GeneralizedState
+from robots import go2
 
 
-vec_env = 4096
+vec_env = 1024
 mini_batch_size = 8192
-num_iterations = 4000
+num_iterations = 2000
 policy_epochs = 4
 critic_epochs = 4
 policy_learning_rate_per_std = 1e-3 # unified
-critic_learning_rate = 5e-4
-rollout_length = 32
+critic_learning_rate = 1e-4
+rollout_length = 64
 
 description = {
         "task": "Test simple ant PPO",
@@ -72,9 +74,9 @@ ppo_config = PPOConfigs(
     policy_learnng_rate_per_std=policy_learning_rate_per_std,
     critic_learning_rate=critic_learning_rate,
     clip_ratio=0.2,
-    entropy_gain=0.001,
-    discount=0.99,
-    td_lambda_discount=0.95,
+    entropy_gain=0.005,
+    discount=0.995,
+    td_lambda_discount=0.975,
     rollout_length=rollout_length,
     vec_env=vec_env,
     mini_batch_size=mini_batch_size,
@@ -87,13 +89,13 @@ seed = 8848
 # seed = 42
 loop_random_key = jax.random.PRNGKey(seed)
 
-# # creat environment (Ant)
-env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
-env = AntWrapper(env)
+# # creat environment (Go2)
+env = envs.create('go2_mjx', episode_length=4096, backend="mjx", auto_reset=True)
+env = Go2Wrapper(env)
 
 structure = "simple"
-critic_hidden_layers: Tuple[int, ...] = (64, 64)
-actor_hidden_layers: Tuple[int, ...] = (64, 64)
+critic_hidden_layers: Tuple[int, ...] = (128, 128)
+actor_hidden_layers: Tuple[int, ...] = (128, 128)
 policy_network = GC_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
@@ -102,7 +104,7 @@ policy_network = GC_PPO_Policy(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.softplus,
     final_activation=jnp.tanh,
-    learnable_std=True,
+    learnable_std=False,
 )
 
 critic_network = GCMLP(
@@ -125,7 +127,7 @@ ppo = PPO(
     policy_network=policy_network,
     critic_network=critic_network,
     ppo_configs=ppo_config,
-    std_anneal_fn=lambda x: jnp.maximum(0.05, 0.5 - x * 1e-4),
+    std_anneal_fn=lambda x: jnp.maximum(0.05, 0.25 - x * 1e-4),
 )
 
 loop_random_key, subkey = jax.random.split(loop_random_key)
@@ -152,7 +154,7 @@ def training_loop(
         ppo_training_state,
         loop_random_key,
     )
-    vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
+    vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 17: 19]**2, axis=-1))
 
     
     loop_random_key, subkey = jax.random.split(loop_random_key)
@@ -174,7 +176,7 @@ def training_loop(
         aux_data.training_data.critic_error,
         aux_data.training_data.approx_kl,
         aux_data.training_data.clip_fraction,
-        # aux_data.rollout_data.average_reward, 
+        aux_data.rollout_data.average_reward, 
         aux_data.rollout_data.average_return,
         # aux_data.rollout_data.average_lifespan,
         jnp.mean(vs),
@@ -183,7 +185,7 @@ def training_loop(
 
 log_period = 10
 
-for i in range(int(num_iterations / log_period)):
+for i in range(int(num_iterations)):
 
     (
         states, 
@@ -193,25 +195,30 @@ for i in range(int(num_iterations / log_period)):
             iteration_critic_error,
             iteration_approx_kl,
             iteration_clip_fraction,
+            iteration_mean_reward,
             iteration_mean_return,
             # iteration_mean_lifespan,
             iteration_mean_v,
-            ) = jax.lax.scan(
-        training_loop,
-        carry,
-        length=log_period,
-    )
-
+            ) = training_loop(carry, None)
 
     wandb.log({
         "critic_RMSE": jnp.mean(iteration_critic_error),
         "approx_kl": jnp.mean(iteration_approx_kl),
         "clip_fraction": jnp.mean(iteration_clip_fraction),
+        "iteration mean reward": jnp.mean(iteration_mean_reward), 
         "iteration mean return": jnp.mean(iteration_mean_return), 
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
 
     carry = (states, ppo_training_state, loop_random_key)
+
+    # print(
+    #     jnp.mean(iteration_critic_error),
+    #     jnp.mean(iteration_approx_kl),
+    #     jnp.mean(iteration_clip_fraction),
+    #     jnp.mean(iteration_mean_return),
+    #     jnp.mean(iteration_mean_v),
+    # )
 
 # (
 #     final_states, 

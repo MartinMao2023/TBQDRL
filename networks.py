@@ -379,7 +379,7 @@ class GC_PPO_Policy(nn.Module):
         else:
             std_logits = self.param(
                 'std_logits', 
-                nn.initializers.constant(-2.0), 
+                nn.initializers.constant(0.0), 
                 (self.action_dim,)
             )
         return action_mean, std_logits

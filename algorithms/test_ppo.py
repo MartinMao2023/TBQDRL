@@ -45,7 +45,7 @@ class  PPOTrainingState(PyTreeNode):
     critic_opt_state: optax.OptState
 
     current_std: jax.Array
-    step_num: int
+    iteration_num: int
 
 
 
@@ -111,9 +111,9 @@ class PPO:
         )
 
         if policy_network.learnable_std:
-            std_fn = lambda x, y: nn.sigmoid(x)
+            self._std_selection_fn = lambda x, y: nn.sigmoid(x)
         else:
-            std_fn = lambda x, y: y * jnp.ones_like(x)
+            self._std_selection_fn = lambda x, y: y
 
         
         @jax.jit
@@ -130,8 +130,8 @@ class PPO:
                 
                 state, sampled_state, l, key = carry
                 obs, z = env.get_obs(state)
-                action_mean, std_logits = policy_network.apply(policy_params, obs, z)
-                action_std = std_fn(std_logits, std)
+                action_mean, _ = policy_network.apply(policy_params, obs, z)
+                action_std = std
 
                 key, subkey = jax.random.split(key)
                 candidate_action_noise = action_std * jax.random.normal(subkey, action_mean.shape)
@@ -265,17 +265,25 @@ class PPO:
         critic_params = self._critic_network.init(subkey, obs=fake_obs, z=fake_zs)
         critic_opt_state = self._critic_optimizer.init(critic_params)
 
-
-        initial_std = self._std_anneal_fn(0)
-
+        std_logits = policy_params['params']['std_logits']
+        current_std = self._std_selection_fn(
+            std_logits,
+            self._std_anneal_fn(0),
+            )
         
+        rms_std = jnp.sqrt(jnp.mean(current_std**2))
+        current_learning_rate = rms_std * self._lr_per_std
+        policy_opt_state = policy_opt_state._replace(
+            hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
+        )
+
         training_state = PPOTrainingState(
             policy_params=policy_params,
             critic_params=critic_params,
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
-            current_std=jnp.array(initial_std),
-            step_num=0,
+            current_std=current_std,
+            iteration_num=0,
             )
 
         return training_state
@@ -311,8 +319,12 @@ class PPO:
         )
 
         # annealing
-        step_num = training_state.step_num + 1
-        current_std = self._std_anneal_fn(step_num)
+        iteration_num = training_state.iteration_num + 1
+        std_logits = policy_params['params']['std_logits']
+        current_std = self._std_selection_fn(
+            std_logits,
+            self._std_anneal_fn(iteration_num),
+            )
         rms_std = jnp.sqrt(jnp.mean(current_std**2))
 
         current_learning_rate = rms_std * self._lr_per_std
@@ -326,7 +338,7 @@ class PPO:
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
             current_std=current_std,
-            step_num=step_num,
+            iteration_num=iteration_num,
         )
         training_data = TrainingMetrics(
             critic_error=final_critic_error,

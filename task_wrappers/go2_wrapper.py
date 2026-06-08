@@ -18,7 +18,7 @@ from .tools import IntegrateMatern
 
 
 class TaskState(PyTreeNode):
-    z: jax.Array # last action
+    z: jax.Array # historical force, horizon = 0.05s
 
 
 
@@ -36,20 +36,20 @@ class GeneralizedState(PyTreeNode):
 
 
 
-class CartpoleWrapper(BaseTaskWrapper):
+class Go2Wrapper(BaseTaskWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.z_dim = 0
+        self.z_dim = env.action_size
 
 
     @property
     def has_z(self):
-        return False
+        return True
     
 
     @property
     def z_size(self):
-        return 0
+        return self.z_dim
     
 
     def _extract_state_info_for_task(self, env_state):
@@ -61,21 +61,29 @@ class CartpoleWrapper(BaseTaskWrapper):
     
 
     def get_obs(self, state):
-        return state.env_state.obs, jnp.zeros((1,))
+        return state.env_state.obs, state.z_state.z
     
 
     def step(self, state, action):
-        next_env_state = self.env.step(state.env_state, action * 2 - 1)
+        next_env_state = self.env.step(state.env_state, action)
         truncation = next_env_state.info['truncation']
         done = next_env_state.done - truncation
 
+        ema_force = state.z_state.z
+        force = next_env_state.info["force"]
+        # consistency_penalty = jnp.mean(jnp.square(force - ema_force)) * 0.04
+
         transition_info = TransitionInfo(
-            reward=jnp.array([next_env_state.reward]), 
+            # reward=jnp.array([next_env_state.reward - consistency_penalty + 1.0]),
+            reward=jnp.array([next_env_state.reward]),
             done=jnp.where(done > 0.5, jnp.ones(shape=(1,)), jnp.zeros(shape=(1,))),
             truncation=jnp.array([truncation]),
-            broken=jnp.array([0.0]))
-    
-        return state.replace(env_state=next_env_state), transition_info
+            broken=jnp.array([next_env_state.metrics['is_broken']]),
+            )
+        
+        new_task_state = TaskState(z=0.32968 * force + 0.67032 * ema_force)
+        
+        return state.replace(env_state=next_env_state, z_state=new_task_state), transition_info
     
 
     

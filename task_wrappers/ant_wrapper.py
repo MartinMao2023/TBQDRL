@@ -75,7 +75,8 @@ class AntWrapper(BaseTaskWrapper):
         transition_info = TransitionInfo(
             reward=jnp.array([next_env_state.reward - consistency_penalty]), 
             done=jnp.where(done > 0.5, jnp.ones(shape=(1,)), jnp.zeros(shape=(1,))),
-            truncation=jnp.array([truncation]))
+            truncation=jnp.array([truncation]),
+            broken=jnp.array([0.0]))
         
         new_task_state = TaskState(z=action)
         

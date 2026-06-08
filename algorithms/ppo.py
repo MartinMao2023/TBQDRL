@@ -648,7 +648,7 @@ class PPO:
         rollout_data = RolloutMetrics(
             average_reward=average_reward,
             average_return=jnp.mean(v_values),
-            average_lifespan=jnp.mean(lifespans),
+            average_lifespan=jnp.mean(initial_lifespan),
             )
         
         return rollout_data

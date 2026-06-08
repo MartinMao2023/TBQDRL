@@ -266,11 +266,12 @@ class FiniteMaternWrapper(BaseQDTaskWrapper):
         transition_info = QDTransitionInfo(
             reward=jnp.array([reward]), 
             fitness_reward=fitness_reward,
-            done=jnp.where(done + fail > 0.9, jnp.ones(shape=(1,)), jnp.zeros(shape=(1,))),
-            truncation=jnp.array([truncation]))
+            done=jnp.where(done + fail > 0.5, jnp.ones(shape=(1,)), jnp.zeros(shape=(1,))),
+            truncation=jnp.array([truncation]),
+            broken=jnp.array([0.0]))
 
         new_task_state = jax.lax.cond(
-            next_env_state.done > 0.9,
+            next_env_state.done > 0.5,
             lambda _: state.initial_z_state,
             lambda _: next_task_state,
             None,

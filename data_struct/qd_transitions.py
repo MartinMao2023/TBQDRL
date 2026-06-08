@@ -21,7 +21,8 @@ class QDTransitionInfo(flax.struct.PyTreeNode):
     reward: Reward
     fitness_reward: Reward
     done: Done
-    truncation: jnp.ndarray  # Indicates if an episode has reached max time step
+    truncation: jax.Array  # Indicates if an episode has reached max time step
+    broken: jax.Array # Indicates if the simulation diverged
 
 
 
@@ -30,17 +31,17 @@ class QDPPOTransition(flax.struct.PyTreeNode):
 
     obs: Observation
     actions: Action
-    zs: jnp.ndarray # task / history embedding
-    log_likelihood: jnp.ndarray # excluding log(2*pi)
-    rewards: jnp.ndarray
-    fitness_rewards: jnp.ndarray
-    td_lambda_returns: jnp.ndarray
-    fitness_td_lambda_returns: jnp.ndarray
-    gaes: jnp.ndarray
-    conditioned: jnp.ndarray # If require conditioned optimization
+    zs: jax.Array # task / history embedding
+    log_likelihood: jax.Array # excluding log(2*pi)
+    rewards: jax.Array
+    fitness_rewards: jax.Array
+    td_lambda_returns: jax.Array
+    fitness_td_lambda_returns: jax.Array
+    gaes: jax.Array
+    conditioned: jax.Array # If require conditioned optimization
     dones: Done
-    truncations: jnp.ndarray  # Indicates if an episode has reached max time step
-    weights: jnp.ndarray  # weight resulting from truncation 
+    truncations: jax.Array  # Indicates if an episode has reached max time step
+    weights: jax.Array  # weight resulting from truncation 
 
     @property
     def observation_dim(self) -> int:
@@ -79,10 +80,10 @@ class QDPPOTransition(flax.struct.PyTreeNode):
         return flatten_dim
 
 
-    def flatten(self) -> jnp.ndarray:
+    def flatten(self) -> jax.Array:
         """
         Returns:
-            a jnp.ndarray that corresponds to the flattened transition.
+            a jax.Array that corresponds to the flattened transition.
         """
         flatten_transition = jnp.concatenate(
             [
@@ -108,14 +109,14 @@ class QDPPOTransition(flax.struct.PyTreeNode):
     @classmethod
     def from_flatten(
         cls,
-        flattened_transition: jnp.ndarray,
+        flattened_transition: jax.Array,
         transition: QDPPOTransition,
     ) -> QDPPOTransition:
         """
-        Creates a transition from a flattened transition in a jnp.ndarray.
+        Creates a transition from a flattened transition in a jax.Array.
 
         Args:
-            flattened_transition: flattened transition in a jnp.ndarray of shape
+            flattened_transition: flattened transition in a jax.Array of shape
                 (batch_size, flatten_dim)
             transition: a transition object (might be a dummy one) to
                 get the dimensions right
@@ -238,10 +239,10 @@ class QDTransition(Transition):
         )
         return flatten_dim
 
-    def flatten(self) -> jnp.ndarray:
+    def flatten(self) -> jax.Array:
         """
         Returns:
-            a jnp.ndarray that corresponds to the flattened transition.
+            a jax.Array that corresponds to the flattened transition.
         """
         flatten_transition = jnp.concatenate(
             [
@@ -261,14 +262,14 @@ class QDTransition(Transition):
     @classmethod
     def from_flatten(
         cls,
-        flattened_transition: jnp.ndarray,
+        flattened_transition: jax.Array,
         transition: QDTransition,
     ) -> QDTransition:
         """
-        Creates a transition from a flattened transition in a jnp.ndarray.
+        Creates a transition from a flattened transition in a jax.Array.
 
         Args:
-            flattened_transition: flattened transition in a jnp.ndarray of shape
+            flattened_transition: flattened transition in a jax.Array of shape
                 (batch_size, flatten_dim)
             transition: a transition object (might be a dummy one) to
                 get the dimensions right
@@ -370,10 +371,10 @@ class DCRLTransition(QDTransition):
         )
         return flatten_dim
 
-    def flatten(self) -> jnp.ndarray:
+    def flatten(self) -> jax.Array:
         """
         Returns:
-            a jnp.ndarray that corresponds to the flattened transition.
+            a jax.Array that corresponds to the flattened transition.
         """
         flatten_transition = jnp.concatenate(
             [
@@ -395,13 +396,13 @@ class DCRLTransition(QDTransition):
     @classmethod
     def from_flatten(
         cls,
-        flattened_transition: jnp.ndarray,
+        flattened_transition: jax.Array,
         transition: DCRLTransition,
     ) -> DCRLTransition:
         """
-        Creates a transition from a flattened transition in a jnp.ndarray.
+        Creates a transition from a flattened transition in a jax.Array.
         Args:
-            flattened_transition: flattened transition in a jnp.ndarray of shape
+            flattened_transition: flattened transition in a jax.Array of shape
                 (batch_size, flatten_dim)
             transition: a transition object (might be a dummy one) to
                 get the dimensions right
