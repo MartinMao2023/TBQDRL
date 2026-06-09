@@ -10,11 +10,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from datetime import datetime
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
-# from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
-# from algorithms.qd_ppo import QDPPO, QDPPOConfigs, QDPPOTrainingState
-from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
+from algorithms.gmm_ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
-from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
+from networks import GCMLP, GC_GMM_PPO_Policy
 # from functools import partial
 from flax import serialization
 from task_wrappers.ant_wrapper import AntWrapper
@@ -26,12 +24,12 @@ mini_batch_size = 8192
 num_iterations = 4000
 policy_epochs = 4
 critic_epochs = 4
-policy_learning_rate_per_std = 1e-3 # unified
+policy_learning_rate_per_std = 5e-4 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
 
 description = {
-        "task": "Test simple ant PPO",
+        "task": "GMM PPO test",
         "policy_learning_rate": policy_learning_rate_per_std,
         "critic_learning_rate": critic_learning_rate,
         "architecture": "Simple MLP for both networks",
@@ -83,18 +81,22 @@ ppo_config = PPOConfigs(
 )
 
 
-# seed = 8848
-seed = 42
+seed = 66543
+# seed = 42
 loop_random_key = jax.random.PRNGKey(seed)
+loop_random_key, subkey = jax.random.split(loop_random_key)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
 env = AntWrapper(env)
+component_means = jnp.concatenate([
+    jnp.zeros(env.action_size), jax.random.normal(subkey, shape=(3 * env.action_size)) * 0.25
+])
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (64, 64)
 actor_hidden_layers: Tuple[int, ...] = (128, 128)
-policy_network = GC_PPO_Policy(
+policy_network = GC_GMM_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
     initial_std=0.1 * jnp.ones(env.action_size),
@@ -103,6 +105,8 @@ policy_network = GC_PPO_Policy(
     activation=nn.softplus,
     final_activation=jnp.tanh,
     learnable_std=True,
+    component_num=4,
+    component_means=component_means,   
 )
 
 critic_network = GCMLP(
@@ -131,7 +135,7 @@ ppo = PPO(
 loop_random_key, subkey = jax.random.split(loop_random_key)
 ppo_training_state = ppo.init(subkey)
 
-seed = 4242
+seed = 114514
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
@@ -210,6 +214,8 @@ for i in range(int(num_iterations / log_period)):
         "iteration mean return": jnp.mean(iteration_mean_return), 
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
+    
+    print("v", jnp.mean(iteration_mean_v), "\t", "return", jnp.mean(iteration_mean_return))
 
     carry = (states, ppo_training_state, loop_random_key)
 

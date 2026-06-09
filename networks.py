@@ -431,47 +431,82 @@ class GC_BinaryPPO_Policy(nn.Module):
 
 
 
-class MLPTC(nn.Module):
-    """Trajectory-Conditioned MLP module."""
 
-    layer_sizes: Tuple[int, ...]
-    offset_sigma: float
+class GC_GMM_PPO_Policy(nn.Module):
+    """
+    Goal-conditioned GMM PPO policy module.
+    """
+
+    hidden_layer_sizes: Tuple[int, ...]
+    action_dim: int
+    component_num: int
+    initial_std: jnp.ndarray
+    learnable_std: bool = False
     activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
     kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
-    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = nn.tanh
     bias: bool = True
     kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+    component_means: jax.Array = None
+
 
     @nn.compact
-    def __call__(self, obs: jnp.ndarray, offset: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
-        hidden = jnp.concatenate([obs, 10*jnp.tanh(offset/self.offset_sigma*0.1), z], axis=-1)
-        # hidden = jnp.concatenate([obs, offset, z], axis=-1)
-        for i, hidden_size in enumerate(self.layer_sizes):
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
 
-            if i != len(self.layer_sizes) - 1:
-                hidden = nn.Dense(
-                    hidden_size,
-                    kernel_init=self.kernel_init,
-                    use_bias=self.bias,
-                )(hidden)
-                hidden = self.activation(hidden)  # type: ignore
+        for hidden_size in self.hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
 
-            else:
-                if self.kernel_init_final is not None:
-                    kernel_init = self.kernel_init_final
-                else:
-                    kernel_init = self.kernel_init
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
 
-                hidden = nn.Dense(
-                    hidden_size,
-                    kernel_init=kernel_init,
-                    use_bias=self.bias,
-                )(hidden)
+        action_mean = nn.Dense(
+            self.action_dim * self.component_num,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(hidden)
 
-                if self.final_activation is not None:
-                    hidden = self.final_activation(hidden)
+        if self.component_means is not None:
+            action_mean = action_mean + self.component_means
 
-        return hidden
+        weights_logits = nn.Dense(
+            self.component_num,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(hidden)
+
+
+        if self.final_activation is not None:
+            action_mean = self.final_activation(action_mean)
+
+        if self.learnable_std:
+            std_logits = self.param(
+                'std_logits', 
+                nn.initializers.constant(0.0), 
+                (self.action_dim,)
+            )
+        else:
+            std_logits = self.param(
+                'std_logits', 
+                nn.initializers.constant(0.0), 
+                (self.action_dim,)
+            )
+
+        new_shape = obs.shape[:-1] + (self.component_num, self.action_dim)
+        return jnp.reshape(action_mean, new_shape), weights_logits, std_logits
+
+
 
 
 
@@ -496,31 +531,6 @@ class QModule(nn.Module):
         return jnp.concatenate(res, axis=-1)
 
 
-class QModuleTC(nn.Module):
-    """Q Module."""
-
-    hidden_layer_sizes: Tuple[int, ...]
-    offset_sigma: float
-    n_critics: int = 2
-    activation: Callable = nn.relu
-    final_activation: Callable = None
-
-    @nn.compact
-    def __call__(
-        self, obs: jnp.ndarray, actions: jnp.ndarray, offset: jnp.ndarray, z: jnp.ndarray
-    ) -> jnp.ndarray:
-        hidden = jnp.concatenate([obs, actions], axis=-1)
-        res = []
-        for _ in range(self.n_critics):
-            q = MLPTC(
-                layer_sizes=self.hidden_layer_sizes + (1,),
-                offset_sigma=self.offset_sigma,
-                activation=self.activation,
-                kernel_init=jax.nn.initializers.lecun_uniform(),
-                final_activation=self.final_activation,
-            )(hidden, offset, z)
-            res.append(q)
-        return jnp.concatenate(res, axis=-1)
 
 
 
