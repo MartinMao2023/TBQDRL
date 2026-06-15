@@ -26,7 +26,8 @@ mini_batch_size = 8192
 num_iterations = 4000
 policy_epochs = 4
 critic_epochs = 4
-policy_learning_rate_per_std = 1e-3 # unified
+# policy_learning_rate_per_std = 1e-3 # unified
+policy_learning_rate_per_std = 5e-4 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
 
@@ -84,7 +85,7 @@ ppo_config = PPOConfigs(
 
 
 # seed = 8848
-seed = 42
+seed = 4242
 loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
@@ -131,7 +132,7 @@ ppo = PPO(
 loop_random_key, subkey = jax.random.split(loop_random_key)
 ppo_training_state = ppo.init(subkey)
 
-seed = 4242
+seed = 114514
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)

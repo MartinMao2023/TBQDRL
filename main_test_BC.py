@@ -1,0 +1,395 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+import jax
+import flax.linen as nn
+import jax.numpy as jnp
+from brax import envs
+from flax import serialization
+from typing import Tuple
+
+from custom_types import RNGKey, Params
+from networks import GC_GMM_PPO_Policy, GC_PPO_Policy, GC_Student_PPO_Policy
+from task_wrappers.ant_wrapper import AntWrapper
+from data_struct.distillation_transitions import GMMDistillationTransition
+from data_struct.states import GeneralizedState
+from algorithms.behavior_cloning import BC, BCConfigs
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+VEC_ENV        = 4096
+ROLLOUT_LENGTH = 128
+N_AGG          = 32                                  # rollout iterations per aggregation
+FRACTION       = 8                                   # keep 1/FRACTION of each rollout
+EIGHTH         = VEC_ENV * ROLLOUT_LENGTH // FRACTION  # 65 536  samples per agg step
+TOTAL          = N_AGG * EIGHTH                      # 1 048 576 total after aggregation
+
+MINI_BATCH_SIZE = 4096
+MINIBATCH_NUM   = 16   # inner scan steps  (gradient updates per bc-iteration)
+BC_ITERATIONS   = TOTAL // MINI_BATCH_SIZE // MINIBATCH_NUM   # outer scan steps  (each emits one EMA loss value)
+# sanity: BC_ITERATIONS * MINIBATCH_NUM * MINI_BATCH_SIZE == TOTAL  →  16*16*4096 == 1 048 576 ✓
+
+NUM_MAIN_LOOPS = 1  # outer Python for-loop
+
+actor_hidden_layers: Tuple[int, ...] = (128, 128)
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
+env = AntWrapper(env)
+
+# ---------------------------------------------------------------------------
+# Teacher network — seeds must match main_ant_GMM.py / test_GMM.ipynb exactly.
+# component_means are a network *attribute* (not saved in params), so the same
+# PRNGKey must be used to reproduce them.
+# ---------------------------------------------------------------------------
+seed = 624234
+loop_random_key = jax.random.PRNGKey(seed)
+loop_random_key, subkey = jax.random.split(loop_random_key)
+component_means = jnp.concatenate([
+    jnp.zeros(env.action_size),
+    jax.random.normal(subkey, shape=(3 * env.action_size)) * 0.25,
+])
+
+teacher_network = GC_GMM_PPO_Policy(
+    hidden_layer_sizes=actor_hidden_layers,
+    action_dim=env.action_size,
+    initial_std=0.1 * jnp.ones(env.action_size),
+    kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
+    kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+    activation=nn.softplus,
+    final_activation=jnp.tanh,
+    learnable_std=True,
+    component_num=4,
+    component_means=component_means,
+)
+
+seed = 4242
+random_key = jax.random.PRNGKey(seed)
+fake_obs = jnp.zeros(shape=(env.observation_size,))
+fake_zs  = jnp.zeros(shape=(env.z_size,))
+policy_template = teacher_network.init(random_key, obs=fake_obs, z=fake_zs)
+
+with open("output/GMM/policy.msgpack", "rb") as f:
+    teacher_params = serialization.from_bytes(policy_template, f.read())
+
+teacher_std = jax.nn.sigmoid(teacher_params["params"]["std_logits"])
+print(f"Teacher std: {teacher_std}")
+
+# ---------------------------------------------------------------------------
+# Student network  (single Gaussian, same hidden layers as teacher)
+# ---------------------------------------------------------------------------
+
+student_hidden_layers = (128, 128)
+student_network = GC_Student_PPO_Policy(
+    hidden_layer_sizes=actor_hidden_layers,
+    action_dim=env.action_size,
+    initial_std=0.1 * jnp.ones(env.action_size),
+    kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
+    kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+    activation=nn.softplus,
+    final_activation=jnp.tanh,
+    learnable_std=True,
+    component_num=4,
+    component_means=component_means,
+)
+#     hidden_layer_sizes=student_hidden_layers,
+#     action_dim=env.action_size,
+#     initial_std=0.1 * jnp.ones(env.action_size),
+#     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
+#     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+#     activation=nn.softplus,
+#     final_activation=jnp.tanh,
+#     learnable_std=True,
+#     component_num=4,
+#     component_means=component_means,
+# )
+
+bc_configs = BCConfigs(
+    learning_rate=1e-3,
+    bc_epochs=1,          # unused by state_update_scan; kept for API compat
+    mini_batch_size=MINI_BATCH_SIZE,
+    num_mini_batches=MINIBATCH_NUM,   # sets ema_alpha for the inner scan
+)
+
+bc = BC(
+    env=env,
+    policy_network=student_network,
+    teacher_std=teacher_std,
+    bc_configs=bc_configs,
+)
+
+random_key, subkey = jax.random.split(random_key)
+bc_training_state = bc.init(subkey)
+
+
+@jax.jit
+def aggregate_data(
+    policy_params: Params,
+    starting_states: GeneralizedState,
+    key: RNGKey,
+) -> Tuple[GeneralizedState, RNGKey, GMMDistillationTransition, jax.Array]:
+
+    def agg_step(
+        carry: Tuple[GeneralizedState, RNGKey],
+        _,
+    ) -> Tuple[Tuple, Tuple[GMMDistillationTransition, jax.Array]]:
+        states, key = carry
+
+        # Per-environment rollout step
+        def play_step_fn(
+            carry: Tuple[GeneralizedState, RNGKey, jax.Array, jax.Array],
+        ) -> Tuple[Tuple, GMMDistillationTransition]:
+            state, step_key, cum_r, survive = carry
+
+            obs, z = env.get_obs(state)
+            action_means, weight_logits, std_logits = teacher_network.apply(
+                policy_params, obs, z
+            )
+            # action_std = nn.sigmoid(std_logits) * 2
+            action_std = teacher_std
+
+            component_weights = nn.softmax(weight_logits) # (k,)
+            # step_key, subkey = jax.random.split(step_key)
+            # action_mean = jax.random.choice(subkey, a=action_means, p=component_weights)
+
+
+            # best_idx = jnp.argmax(weight_logits)
+            # action_mean = action_means[best_idx]
+            action_mean = jnp.sum(action_means * component_weights[:, None], axis=0)
+
+            step_key, subkey = jax.random.split(step_key)
+            noise  = action_std * jax.random.normal(subkey, action_mean.shape)
+            action = jnp.clip(action_mean + noise, -1.0, 1.0)
+            # action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+
+            state, tinfo = env.step(state, action)
+
+            cum_r = cum_r + survive * tinfo.reward
+            survive = survive * (1.0 - tinfo.done)
+
+            transition = GMMDistillationTransition(
+                obs=obs,
+                zs=z,
+                action_means=action_means,       # (k, action_dim)
+                component_weights=component_weights,  # (k,)
+            )
+            return (state, step_key, cum_r, survive), transition
+
+        key, subkey = jax.random.split(key)
+        rollout_keys = jax.random.split(subkey, num=VEC_ENV)
+
+        (final_states, _, cum_rewards, _), transitions = jax.lax.scan(
+            lambda x, _: jax.vmap(play_step_fn)(x),
+            (states, rollout_keys, jnp.zeros((VEC_ENV, 1)), jnp.ones((VEC_ENV, 1))),
+            length=ROLLOUT_LENGTH,
+        )
+        # transitions fields: (ROLLOUT_LENGTH, VEC_ENV, ...)
+
+        # Shuffle across the full (ROLLOUT_LENGTH × VEC_ENV) pool, take 1/8.
+        key, subkey = jax.random.split(key)
+        transitions = transitions.shuffle(subkey)            # (ROLLOUT_LENGTH*VEC_ENV, ...)
+        transitions = jax.tree.map(lambda x: x[:EIGHTH], transitions)  # (EIGHTH, ...)
+
+        return (final_states, key), (transitions, cum_rewards)
+
+    (final_states, final_key), (agg_transitions, all_cum_rewards) = jax.lax.scan(
+        agg_step,
+        (starting_states, key),
+        length=N_AGG,
+    )
+    # agg_transitions fields: (N_AGG, EIGHTH, ...)
+    # all_cum_rewards:         (N_AGG, VEC_ENV)
+    return final_states, final_key, agg_transitions, all_cum_rewards
+
+
+# ---------------------------------------------------------------------------
+# Initial env reset  (seed 114514 matches main_ant_GMM.py)
+# ---------------------------------------------------------------------------
+loop_random_key = jax.random.PRNGKey(114514)
+loop_random_key, subkey = jax.random.split(loop_random_key)
+subkeys = jax.random.split(subkey, num=VEC_ENV)
+states = jax.vmap(env.reset)(subkeys)
+
+
+
+@jax.jit
+def scan_bc(carry: Tuple, data: GMMDistillationTransition) -> Tuple[Tuple, float]:
+    training_state = carry
+    carry, metrics = bc.state_update(training_state, data)
+
+    return carry, metrics.bc_loss
+
+
+
+
+# ---------------------------------------------------------------------------
+# Main distillation loop
+# ---------------------------------------------------------------------------
+for main_loop in range(NUM_MAIN_LOOPS):
+
+    # ------------------------------------------------------------------
+    # Stage 1: aggregate N_AGG rollout iterations into one large dataset
+    # ------------------------------------------------------------------
+    states, loop_random_key, agg_transitions, all_cum_rewards = aggregate_data(
+        teacher_params, states, loop_random_key
+    )
+    teacher_avg_reward = jnp.mean(all_cum_rewards) / ROLLOUT_LENGTH
+
+    mixed = jax.tree.map(
+        lambda x: jnp.swapaxes(x, 0, 1).reshape(TOTAL, *x.shape[2:]),
+        agg_transitions,
+    )
+    batched = jax.tree.map(
+        lambda x: x.reshape(BC_ITERATIONS, MINIBATCH_NUM, MINI_BATCH_SIZE, *x.shape[1:]),
+        mixed,
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 2: OUTER_EPOCHS passes over the same aggregated dataset.
+    # Each pass runs state_update_scan which:
+    #   • outer scan → BC_ITERATIONS steps, one EMA loss per step
+    #   • inner scan → MINIBATCH_NUM gradient updates per step
+    # ------------------------------------------------------------------
+    print(f"[{main_loop + 1:3d}/{NUM_MAIN_LOOPS}] ")
+    print(f"teacher_avg_reward = {float(teacher_avg_reward):.4f}  |  ")
+
+
+    for i in range(128):
+        bc_training_state, losses = jax.lax.scan(
+            scan_bc,
+            bc_training_state,
+            batched,
+        )
+        print(
+            # f"bc_loss  mean={float(jnp.mean(losses)):.6f}  "
+            f"last={float(losses[-1]):.6f}  "
+            # f"[{', '.join(f'{float(l):.4f}' for l in losses)}]"
+        )
+
+
+
+@jax.jit
+def student_rollout_fn(
+    student_params: Params,
+    starting_states: GeneralizedState,
+    keys: RNGKey,
+) -> jax.Array:
+    """Returns cumulative rewards per env over one rollout with the student."""
+
+    def play_step_fn(
+        carry: Tuple[GeneralizedState, RNGKey, jax.Array, jax.Array],
+    ) -> Tuple[Tuple, None]:
+        state, key, cum_r, survive = carry
+
+        obs, z = env.get_obs(state)
+        action_mean, _ = student_network.apply(student_params, obs, z)
+
+        key, subkey = jax.random.split(key)
+        noise  = teacher_std * jax.random.normal(subkey, action_mean.shape)
+        action = jnp.clip(action_mean + noise, -1.0, 1.0)
+        # action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+        # action = action_mean
+
+        state, tinfo = env.step(state, action)
+
+        # cum_r   = cum_r   + survive * tinfo.reward
+        cum_r   = cum_r + tinfo.reward
+
+        survive = survive * (1.0 - tinfo.done)
+
+        return (state, key, cum_r, survive), None
+
+    (_, _, cum_rewards, _), _ = jax.lax.scan(
+        lambda x, _: jax.vmap(play_step_fn)(x),
+        (starting_states, keys, jnp.zeros((VEC_ENV, 1)), jnp.ones((VEC_ENV, 1))),
+        length=1024,
+    )
+    return cum_rewards
+
+
+@jax.jit
+def teacher_rollout_fn(
+    teacher_params: Params,
+    starting_states: GeneralizedState,
+    keys: RNGKey,
+) -> jax.Array:
+    """Returns cumulative rewards per env over one rollout with the teacher."""
+
+    def play_step_fn(
+        carry: Tuple[GeneralizedState, RNGKey, jax.Array, jax.Array],
+    ) -> Tuple[Tuple, None]:
+        state, key, cum_r, survive = carry
+
+        obs, z = env.get_obs(state)
+        action_means, weight_logits, std_logits = teacher_network.apply(teacher_params, obs, z)
+
+        component_weights = nn.softmax(weight_logits) # (k,)
+        action_mean = jnp.sum(action_means * component_weights[:, None], axis=0)
+        # key, subkey = jax.random.split(key)
+        # action = action_mean
+        key, subkey = jax.random.split(key)
+        noise  = teacher_std * jax.random.normal(subkey, action_mean.shape)
+        action = jnp.clip(action_mean + noise, -1.0, 1.0)
+
+        state, tinfo = env.step(state, action)
+
+        # cum_r   = cum_r   + survive * tinfo.reward
+        cum_r   = cum_r  +  tinfo.reward
+        survive = survive * (1.0 - tinfo.done)
+
+        return (state, key, cum_r, survive), None
+
+    (_, _, cum_rewards, _), _ = jax.lax.scan(
+        lambda x, _: jax.vmap(play_step_fn)(x),
+        (starting_states, keys, jnp.zeros((VEC_ENV, 1)), jnp.ones((VEC_ENV, 1))),
+        length=1024,
+    )
+    return cum_rewards
+
+
+print("\n" + "=" * 60)
+print("Distillation complete. Evaluating student policy ...")
+
+loop_random_key, subkey = jax.random.split(loop_random_key)
+eval_keys = jax.random.split(subkey, num=VEC_ENV)
+
+# Fresh env reset for a clean evaluation episode.
+loop_random_key, subkey = jax.random.split(loop_random_key)
+eval_subkeys = jax.random.split(subkey, num=VEC_ENV)
+eval_states = jax.vmap(env.reset)(eval_subkeys)
+
+student_cum_rewards = student_rollout_fn(
+    bc_training_state.policy_params, eval_states, eval_keys
+)
+student_avg_reward = float(jnp.mean(student_cum_rewards) / 1024)
+
+# Re-use the teacher on the same starting states for a fair comparison.
+# _, _, _, teacher_cum_rewards = aggregate_data(
+#     teacher_params, eval_states, loop_random_key
+# )
+teacher_cum_rewards = teacher_rollout_fn(
+    teacher_params, eval_states, eval_keys
+)
+teacher_eval_avg_reward = float(jnp.mean(teacher_cum_rewards) / 1024)
+
+print(f"  Teacher avg reward : {teacher_eval_avg_reward:.4f}")
+print(f"  Student avg reward : {student_avg_reward:.4f}")
+print(f"  Ratio  (student/teacher) : {student_avg_reward / (teacher_eval_avg_reward + 1e-8):.3f}")
+
+print("=" * 60)
+print("Saving student policy")
+
+model_bytes = serialization.to_bytes(bc_training_state.policy_params)
+folder_path = f"./output/GMM"
+
+with open(folder_path + f"/student_policy.msgpack", "wb") as f:
+    f.write(model_bytes)
+
+print("=" * 60)
+
+
+

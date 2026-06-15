@@ -55,15 +55,14 @@ wandb.init(
 
 
 # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-# folder_path = f"./output/matern/output_{timestamp}"
+folder_path = f"./output/GMM"
 
-# if not os.path.exists(folder_path):
-#     os.makedirs(folder_path, exist_ok=True)
-#     print(f"new folder <{folder_path}> created")
+if not os.path.exists(folder_path):
+    os.makedirs(folder_path, exist_ok=True)
+    print(f"new folder <{folder_path}> created")
 
-
-# with open(folder_path + "/description.log", "w") as f:
-#     f.write(description_text)
+with open(folder_path + "/description.log", "w") as f:
+    f.write(description_text)
 
 
 ppo_config = PPOConfigs(
@@ -219,21 +218,21 @@ for i in range(int(num_iterations / log_period)):
 
     carry = (states, ppo_training_state, loop_random_key)
 
-# (
-#     final_states, 
-#     final_ppo_training_state, 
-#     loop_random_key,
-# ) = carry
+(
+    final_states, 
+    final_ppo_training_state, 
+    loop_random_key,
+) = carry
 
-# model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
-# critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
+model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
+critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
 # fitness_critic_bytes = serialization.to_bytes(final_ppo_training_state.fitness_critic_params)
 
-# with open(folder_path + f"/model_{structure}.msgpack", "wb") as f:
-#     f.write(model_bytes)
+with open(folder_path + f"/policy.msgpack", "wb") as f:
+    f.write(model_bytes)
 
-# with open(folder_path + f"/critic_{structure}.msgpack", "wb") as f:
-#     f.write(critic_bytes)
+with open(folder_path + f"/critic.msgpack", "wb") as f:
+    f.write(critic_bytes)
 
 # with open(folder_path + f"/fitness_critic_{structure}.msgpack", "wb") as f:
 #     f.write(fitness_critic_bytes)
