@@ -146,7 +146,7 @@ def aggregate_data(
             state, step_key, cum_r, survive = carry
 
             obs, z = env.get_obs(state)
-            action_means, weight_logits, std_logits = teacher_network.apply(
+            action_means, weight_logits, _ = teacher_network.apply(
                 policy_params, obs, z
             )
             # action_std = nn.sigmoid(std_logits) * 2
@@ -175,7 +175,7 @@ def aggregate_data(
                 obs=obs,
                 zs=z,
                 action_means=action_means,       # (k, action_dim)
-                component_weights=component_weights,  # (k,)
+                component_logits=weight_logits,  # (k,)
             )
             return (state, step_key, cum_r, survive), transition
 

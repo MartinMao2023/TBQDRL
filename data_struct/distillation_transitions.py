@@ -20,13 +20,13 @@ class GMMDistillationTransition(flax.struct.PyTreeNode):
         obs               (..., obs_dim)
         zs                (..., z_dim)
         action_means      (..., k, action_dim)   — teacher's component means
-        component_weights (..., k)               — softmax(teacher weight_logits)
+        component_logits (..., k)               — softmax(teacher weight_logits)
     """
 
     obs: Observation
     zs: jax.Array
     action_means: jax.Array
-    component_weights: jax.Array
+    component_logits: jax.Array
 
     # ------------------------------------------------------------------
     # Shape properties
@@ -68,7 +68,7 @@ class GMMDistillationTransition(flax.struct.PyTreeNode):
             *batch_shape, self.num_components * self.action_dim
         )
         return jnp.concatenate(
-            [self.obs, self.zs, flat_means, self.component_weights], axis=-1
+            [self.obs, self.zs, flat_means, self.component_logits], axis=-1
         ).reshape(-1, self.flatten_dim)
 
     @classmethod
@@ -97,13 +97,13 @@ class GMMDistillationTransition(flax.struct.PyTreeNode):
         flat_means = flattened_transition[:, cursor : cursor + k * action_dim]
         action_means = flat_means.reshape(-1, k, action_dim)
         cursor += k * action_dim
-        component_weights = flattened_transition[:, cursor : cursor + k]
+        component_logits = flattened_transition[:, cursor : cursor + k]
 
         return cls(
             obs=obs,
             zs=zs,
             action_means=action_means,
-            component_weights=component_weights,
+            component_logits=component_logits,
         )
 
     @classmethod
@@ -119,7 +119,7 @@ class GMMDistillationTransition(flax.struct.PyTreeNode):
             obs=jnp.zeros(shape=(1, observation_dim)),
             zs=jnp.zeros(shape=(1, z_dim)),
             action_means=jnp.zeros(shape=(1, num_components, action_dim)),
-            component_weights=jnp.zeros(shape=(1, num_components)),
+            component_logits=jnp.zeros(shape=(1, num_components)),
         )
 
     def shuffle(self, key: RNGKey) -> GMMDistillationTransition:

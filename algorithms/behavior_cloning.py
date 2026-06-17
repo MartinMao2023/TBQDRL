@@ -110,16 +110,16 @@ class BC:
             # ---------------------------------------
             # # Select the component with the largest weight per sample.
             # # One-hot gather avoids dynamic integer indexing.
-            # best_idx = jnp.argmax(transitions.component_weights, axis=-1)  # (B,)
+            # best_idx = jnp.argmax(transitions.component_logits, axis=-1)  # (B,)
             # k = transitions.action_means.shape[-2]
             # one_hot = jax.nn.one_hot(best_idx, num_classes=k)              # (B, k)
             # # (B, action_dim)
             # target_mean = jnp.einsum("bk,bkd->bd", one_hot, transitions.action_means)
 
             # test if mean works better
-            # target_mean = jnp.einsum("bk,bkd->bd", transitions.component_weights, transitions.action_means)
+            # target_mean = jnp.einsum("bk,bkd->bd", transitions.component_logits, transitions.action_means)
             target_mean = jnp.sum(
-                transitions.component_weights[..., None] * transitions.action_means,
+                transitions.component_logits[..., None] * transitions.action_means,
                 axis=-2,
             )
 
