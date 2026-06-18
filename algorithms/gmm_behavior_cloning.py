@@ -1,6 +1,4 @@
-from click.utils import R
 from flax.struct import dataclass
-
 from functools import partial
 from typing import Any, Tuple
 
@@ -17,7 +15,7 @@ from task_wrappers.base import BaseTaskWrapper
 
 @dataclass
 class GMMBCConfigs:
-    learning_rate: float = 5e-4
+    learning_rate: float = 1e-3
     bc_epochs: int = 1
     mini_batch_size: int = 2048
     # Number of mini-batches per epoch; used to set the EMA decay for loss
@@ -107,7 +105,7 @@ class GMMDistillationBC:
                 policy_params:  Student policy parameters.
                 transitions:    Mini-batch of ``GMMDistillationTransition``,
                                 carrying the teacher's component means and
-                                weights for each state.
+                                weight_logits for each state.
                 key:            Random key
 
             Returns:
@@ -116,31 +114,51 @@ class GMMDistillationBC:
                 a secondary diagnostic).
             """
 
+            key1, key2, key3 = jax.random.split(key, num=3)
+
             action_means, weight_logits, _ = policy_network.apply(
                 policy_params, transitions.obs, transitions.zs
             )
-            current_means, current_weight_logits = jax.lax.stop_gradient(action_means, weight_logits)
+            current_means, current_weight_logits = jax.lax.stop_gradient((action_means, weight_logits))
             component_weights = nn.softmax(weight_logits) # B, k
             sampled_actions = jax.random.normal(
-                key, action_means.shape
+                key1, action_means.shape
                 ) * teacher_std + action_means # B, k, d
 
             current_distances = jnp.square(sampled_actions[:, :, None, :] - current_means[:, None, :, :]) # B, k, k, d
             target_distances = jnp.square(sampled_actions[:, :, None, :] - transitions.action_means[:, None, :, :])
-            
-            log_ratio = (current_weight_logits - transitions.component_logits)[:, None, :] - 0.5 * jnp.sum(
-                teacher_inv_var * (current_distances - target_distances), # B, k, k, d
-                axis=-1) # B, k, k
 
-            log_ratio = nn.logsumexp(log_ratio, axis=-1, keepdims=False) # B, k
-            log_ratio = log_ratio - nn.logsumexp(current_weight_logits, axis=-1, keepdims=True) \
-                + nn.logsumexp(transitions.component_logits, axis=-1, keepdims=True) # B, k
-            
+            log_q_components = current_weight_logits[:, None, :] \
+                - 0.5 * jnp.sum(teacher_inv_var * current_distances, axis=-1)   # B, k, k
+
+            log_p_components = transitions.component_logits[:, None, :] \
+                - 0.5 * jnp.sum(teacher_inv_var * target_distances, axis=-1)    # B, k, k
+
+            log_ratio = (
+                nn.logsumexp(log_q_components, axis=-1) - nn.logsumexp(current_weight_logits, axis=-1, keepdims=True)
+            ) - (
+                nn.logsumexp(log_p_components, axis=-1) - nn.logsumexp(transitions.component_logits, axis=-1, keepdims=True)
+            )  # B, k
+
+
+            # Try to add density loss
+            # p = nn.softmax(transitions.component_logits) # B, k
+            # sampled_target_action_mean = jax.random.choice(key2, a=transitions.action_means, p=p, axis=1) # B, d
+            # sampled_target_action = sampled_target_action_mean + jax.random.normal(
+            #     key3, sampled_target_action_mean
+            #     ) * teacher_std # B, d
+            # sample_distances = jnp.square(sampled_target_action[:, None, :] - action_means) # B, k, d
+            # target_log_likelihood = weight_logits - 0.5 * jnp.sum(teacher_inv_var * sample_distances, axis=-1) # B, k
+            # target_log_likelihood = nn.logsumexp(target_log_likelihood, axis=-1) - nn.logsumexp(weight_logits, axis=-1) # B
+
             kl = jnp.mean(
                 jnp.sum(log_ratio * component_weights, axis=-1)
             )
+            # loss = kl - jnp.mean(target_log_likelihood)
 
+            # return loss, kl
             return kl, kl
+        
 
         self._gmm_distillation_loss_fn = gmm_distillation_loss_fn
 
@@ -168,7 +186,7 @@ class GMMDistillationBC:
         return GMMBCTrainingState(
             policy_params=policy_params,
             policy_opt_state=policy_opt_state,
-            ema_loss=0.1,
+            ema_loss=1.0, # For KL
             step_num=0,
         )
 
@@ -200,13 +218,19 @@ class GMMDistillationBC:
             length=self.configs.bc_epochs,
         )
 
+        corrected_loss = jnp.clip(final_loss, min=0.01, max=1)
+        current_learning_rate = jnp.sqrt(corrected_loss) * 1e-3
+        policy_opt_state = policy_opt_state._replace(
+            hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
+        )
+
         new_training_state = GMMBCTrainingState(
             policy_params=policy_params,
             policy_opt_state=policy_opt_state,
             ema_loss=final_loss,
             step_num=training_state.step_num + 1,
         )
-        return (new_training_state, key), GMMBCTrainingMetrics(bc_loss=final_loss)
+        return new_training_state, GMMBCTrainingMetrics(bc_loss=final_loss)
 
     @partial(jax.jit, static_argnames=("self",))
     def _train_gmm_epoch(

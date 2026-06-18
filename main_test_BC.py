@@ -9,11 +9,12 @@ from flax import serialization
 from typing import Tuple
 
 from custom_types import RNGKey, Params
-from networks import GC_GMM_PPO_Policy, GC_PPO_Policy, GC_Student_PPO_Policy
+from networks import GC_GMM_PPO_Policy
 from task_wrappers.ant_wrapper import AntWrapper
 from data_struct.distillation_transitions import GMMDistillationTransition
 from data_struct.states import GeneralizedState
-from algorithms.behavior_cloning import BC, BCConfigs
+# from algorithms.behavior_cloning import BC, BCConfigs
+from algorithms.gmm_behavior_cloning import GMMDistillationBC, GMMBCConfigs
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,7 @@ env = AntWrapper(env)
 # component_means are a network *attribute* (not saved in params), so the same
 # PRNGKey must be used to reproduce them.
 # ---------------------------------------------------------------------------
-seed = 624234
+seed = 6666
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 component_means = jnp.concatenate([
@@ -76,7 +77,8 @@ policy_template = teacher_network.init(random_key, obs=fake_obs, z=fake_zs)
 with open("output/GMM/policy.msgpack", "rb") as f:
     teacher_params = serialization.from_bytes(policy_template, f.read())
 
-teacher_std = jax.nn.sigmoid(teacher_params["params"]["std_logits"])
+teacher_std_logits = teacher_params["params"]["std_logits"]
+teacher_std = jax.nn.sigmoid(teacher_std_logits)
 print(f"Teacher std: {teacher_std}")
 
 # ---------------------------------------------------------------------------
@@ -84,7 +86,7 @@ print(f"Teacher std: {teacher_std}")
 # ---------------------------------------------------------------------------
 
 student_hidden_layers = (128, 128)
-student_network = GC_Student_PPO_Policy(
+student_network = GC_GMM_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
     initial_std=0.1 * jnp.ones(env.action_size),
@@ -108,17 +110,17 @@ student_network = GC_Student_PPO_Policy(
 #     component_means=component_means,
 # )
 
-bc_configs = BCConfigs(
+bc_configs = GMMBCConfigs(
     learning_rate=1e-3,
     bc_epochs=1,          # unused by state_update_scan; kept for API compat
     mini_batch_size=MINI_BATCH_SIZE,
     num_mini_batches=MINIBATCH_NUM,   # sets ema_alpha for the inner scan
 )
 
-bc = BC(
+bc = GMMDistillationBC(
     env=env,
     policy_network=student_network,
-    teacher_std=teacher_std,
+    teacher_std_logits=teacher_std_logits,
     bc_configs=bc_configs,
 )
 
@@ -153,13 +155,10 @@ def aggregate_data(
             action_std = teacher_std
 
             component_weights = nn.softmax(weight_logits) # (k,)
-            # step_key, subkey = jax.random.split(step_key)
-            # action_mean = jax.random.choice(subkey, a=action_means, p=component_weights)
+            step_key, subkey = jax.random.split(step_key)
+            action_mean = jax.random.choice(subkey, a=action_means, p=component_weights)
 
-
-            # best_idx = jnp.argmax(weight_logits)
-            # action_mean = action_means[best_idx]
-            action_mean = jnp.sum(action_means * component_weights[:, None], axis=0)
+            # action_mean = jnp.sum(action_means * component_weights[:, None], axis=0)
 
             step_key, subkey = jax.random.split(step_key)
             noise  = action_std * jax.random.normal(subkey, action_mean.shape)
@@ -218,8 +217,10 @@ states = jax.vmap(env.reset)(subkeys)
 
 @jax.jit
 def scan_bc(carry: Tuple, data: GMMDistillationTransition) -> Tuple[Tuple, float]:
-    training_state = carry
-    carry, metrics = bc.state_update(training_state, data)
+    training_state, key = carry
+    key, subkey = jax.random.split(key)
+    new_training_state, metrics = bc.state_update(training_state, data, subkey)
+    carry = (new_training_state, key)
 
     return carry, metrics.bc_loss
 
@@ -258,57 +259,17 @@ for main_loop in range(NUM_MAIN_LOOPS):
     print(f"teacher_avg_reward = {float(teacher_avg_reward):.4f}  |  ")
 
 
-    for i in range(128):
-        bc_training_state, losses = jax.lax.scan(
+    for i in range(256):
+        (bc_training_state, loop_random_key), losses = jax.lax.scan(
             scan_bc,
-            bc_training_state,
+            (bc_training_state, loop_random_key),
             batched,
         )
         print(
             # f"bc_loss  mean={float(jnp.mean(losses)):.6f}  "
-            f"last={float(losses[-1]):.6f}  "
+            f"KL = {float(losses[-1]):.6f}  "
             # f"[{', '.join(f'{float(l):.4f}' for l in losses)}]"
         )
-
-
-
-@jax.jit
-def student_rollout_fn(
-    student_params: Params,
-    starting_states: GeneralizedState,
-    keys: RNGKey,
-) -> jax.Array:
-    """Returns cumulative rewards per env over one rollout with the student."""
-
-    def play_step_fn(
-        carry: Tuple[GeneralizedState, RNGKey, jax.Array, jax.Array],
-    ) -> Tuple[Tuple, None]:
-        state, key, cum_r, survive = carry
-
-        obs, z = env.get_obs(state)
-        action_mean, _ = student_network.apply(student_params, obs, z)
-
-        key, subkey = jax.random.split(key)
-        noise  = teacher_std * jax.random.normal(subkey, action_mean.shape)
-        action = jnp.clip(action_mean + noise, -1.0, 1.0)
-        # action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
-        # action = action_mean
-
-        state, tinfo = env.step(state, action)
-
-        # cum_r   = cum_r   + survive * tinfo.reward
-        cum_r   = cum_r + tinfo.reward
-
-        survive = survive * (1.0 - tinfo.done)
-
-        return (state, key, cum_r, survive), None
-
-    (_, _, cum_rewards, _), _ = jax.lax.scan(
-        lambda x, _: jax.vmap(play_step_fn)(x),
-        (starting_states, keys, jnp.zeros((VEC_ENV, 1)), jnp.ones((VEC_ENV, 1))),
-        length=1024,
-    )
-    return cum_rewards
 
 
 @jax.jit
@@ -326,11 +287,11 @@ def teacher_rollout_fn(
 
         obs, z = env.get_obs(state)
         action_means, weight_logits, std_logits = teacher_network.apply(teacher_params, obs, z)
-
         component_weights = nn.softmax(weight_logits) # (k,)
-        action_mean = jnp.sum(action_means * component_weights[:, None], axis=0)
-        # key, subkey = jax.random.split(key)
-        # action = action_mean
+
+        key, subkey = jax.random.split(key)
+        action_mean = jax.random.choice(subkey, a=action_means, p=component_weights)
+
         key, subkey = jax.random.split(key)
         noise  = teacher_std * jax.random.normal(subkey, action_mean.shape)
         action = jnp.clip(action_mean + noise, -1.0, 1.0)
@@ -362,7 +323,7 @@ loop_random_key, subkey = jax.random.split(loop_random_key)
 eval_subkeys = jax.random.split(subkey, num=VEC_ENV)
 eval_states = jax.vmap(env.reset)(eval_subkeys)
 
-student_cum_rewards = student_rollout_fn(
+student_cum_rewards = teacher_rollout_fn(
     bc_training_state.policy_params, eval_states, eval_keys
 )
 student_avg_reward = float(jnp.mean(student_cum_rewards) / 1024)
@@ -381,15 +342,15 @@ print(f"  Student avg reward : {student_avg_reward:.4f}")
 print(f"  Ratio  (student/teacher) : {student_avg_reward / (teacher_eval_avg_reward + 1e-8):.3f}")
 
 print("=" * 60)
-print("Saving student policy")
+# print("Saving student policy")
 
-model_bytes = serialization.to_bytes(bc_training_state.policy_params)
-folder_path = f"./output/GMM"
+# model_bytes = serialization.to_bytes(bc_training_state.policy_params)
+# folder_path = f"./output/GMM"
 
-with open(folder_path + f"/student_policy.msgpack", "wb") as f:
-    f.write(model_bytes)
+# with open(folder_path + f"/student_policy.msgpack", "wb") as f:
+#     f.write(model_bytes)
 
-print("=" * 60)
+# print("=" * 60)
 
 
 

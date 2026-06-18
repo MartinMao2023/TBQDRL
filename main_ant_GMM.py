@@ -24,7 +24,7 @@ mini_batch_size = 8192
 num_iterations = 4000
 policy_epochs = 4
 critic_epochs = 4
-policy_learning_rate_per_std = 5e-4 # unified
+policy_learning_rate_per_std = 8e-4 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
 
@@ -226,13 +226,13 @@ for i in range(int(num_iterations / log_period)):
 
 model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
 critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
-# fitness_critic_bytes = serialization.to_bytes(final_ppo_training_state.fitness_critic_params)
 
-with open(folder_path + f"/policy.msgpack", "wb") as f:
-    f.write(model_bytes)
 
-with open(folder_path + f"/critic.msgpack", "wb") as f:
-    f.write(critic_bytes)
+# with open(folder_path + f"/policy.msgpack", "wb") as f:
+#     f.write(model_bytes)
+
+# with open(folder_path + f"/critic.msgpack", "wb") as f:
+#     f.write(critic_bytes)
 
 # with open(folder_path + f"/fitness_critic_{structure}.msgpack", "wb") as f:
 #     f.write(fitness_critic_bytes)
