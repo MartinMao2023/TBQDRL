@@ -11,7 +11,6 @@ from jax import numpy as jnp
 
 from data_struct import PPOTransition
 from data_struct.states import GeneralizedState
-from networks import PPO_Policy
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
 from task_wrappers.base import BaseTaskWrapper
@@ -74,7 +73,7 @@ class PPO:
     def __init__(
         self,
         env: BaseTaskWrapper,
-        policy_network: PPO_Policy,
+        policy_network: nn.Module,
         critic_network: nn.Module,
         ppo_configs: PPOConfigs,
         std_anneal_fn: Callable,

@@ -11,7 +11,6 @@ from jax import numpy as jnp
 
 from data_struct import QDPPOTransition
 from data_struct.states import GeneralizedState
-from networks import PPO_Policy
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
 from task_wrappers.base import BaseQDTaskWrapper
@@ -81,7 +80,7 @@ class QDPPO:
     def __init__(
         self,
         env: BaseQDTaskWrapper,
-        policy_network: PPO_Policy,
+        policy_network: nn.Module,
         critic_network: nn.Module,
         fitness_critic_network: nn.Module,
         ppo_configs: QDPPOConfigs,
