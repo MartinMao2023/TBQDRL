@@ -12,7 +12,7 @@ from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
 # from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
 # from algorithms.qd_ppo import QDPPO, QDPPOConfigs, QDPPOTrainingState
-from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
+from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
 from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
 # from functools import partial
@@ -27,7 +27,7 @@ num_iterations = 4000
 policy_epochs = 4
 critic_epochs = 4
 # policy_learning_rate_per_std = 1e-3 # unified
-policy_learning_rate_per_std = 5e-4 # unified
+policy_learning_rate_per_std = 1e-3 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
 
@@ -94,7 +94,7 @@ env = AntWrapper(env)
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (64, 64)
-actor_hidden_layers: Tuple[int, ...] = (128, 128)
+actor_hidden_layers: Tuple[int, ...] = (256, 256)
 policy_network = GC_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,

@@ -34,6 +34,15 @@ class TransitionInfo(flax.struct.PyTreeNode):
     broken: jax.Array # Indicates if the simulation diverged
 
 
+class MOTransitionInfo(flax.struct.PyTreeNode):
+    """Stores transition information."""
+    reward: Reward
+    mo_reward: jax.Array
+    done: Done
+    truncation: jax.Array  # Indicates if an episode has reached max time step
+    broken: jax.Array # Indicates if the simulation diverged
+
+
 
 class Transition(flax.struct.PyTreeNode):
     """Stores data corresponding to a transition collected by a classic RL algorithm."""

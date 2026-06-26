@@ -14,6 +14,7 @@ from data_struct.states import GeneralizedState
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
 from task_wrappers.base import BaseTaskWrapper
+from networks import GC_GMM_PPO_Policy
 
 
 
@@ -73,7 +74,7 @@ class PPO:
     def __init__(
         self,
         env: BaseTaskWrapper,
-        policy_network: nn.Module,
+        policy_network: GC_GMM_PPO_Policy,
         critic_network: nn.Module,
         ppo_configs: PPOConfigs,
         std_anneal_fn: Callable,
@@ -109,10 +110,6 @@ class PPO:
             learning_rate=ppo_configs.critic_learning_rate,
         )
 
-        if policy_network.learnable_std:
-            std_fn = lambda x, y: nn.sigmoid(x)
-        else:
-            std_fn = lambda x, y: y * jnp.ones_like(x)
 
         if policy_network.learnable_std:
             self._std_selection_fn = lambda x, y: nn.sigmoid(x)
@@ -135,6 +132,9 @@ class PPO:
                 state, sampled_state, l, key = carry
                 obs, z = env.get_obs(state)
                 action_means, weight_logits, _ = policy_network.apply(policy_params, obs, z)
+                # action_means = action_means[4:, :] # TO REMOVE
+                # weight_logits = weight_logits[4:] # TO REMOVE
+
                 action_std = std
 
                 key, subkey = jax.random.split(key)
@@ -218,6 +218,9 @@ class PPO:
             ) -> float:
 
                 action_means, weight_logits, std_logits = policy_network.apply(policy_params, transitions.obs, transitions.zs)
+                # action_means = action_means[:, 4:, :] # TO REMOVE
+                # weight_logits = weight_logits[:, 4:] # TO REMOVE
+
                 std_entropy = jnp.sum(nn.log_sigmoid(std_logits), axis=-1, keepdims=True) # (1,)
                 selection_entropy = nn.logsumexp(weight_logits, axis=-1, keepdims=True) - \
                     jnp.sum(nn.softmax(weight_logits, axis=-1) * weight_logits, axis=-1, keepdims=True) # batch x 1
@@ -248,6 +251,9 @@ class PPO:
             ) -> float:
                 
                 action_means, weight_logits, _ = policy_network.apply(policy_params, transitions.obs, transitions.zs)
+                # action_means = action_means[:, 4:, :] # TO REMOVE
+                # weight_logits = weight_logits[:, 4:] # TO REMOVE
+
                 weight_logits = weight_logits - jax.lax.stop_gradient(jnp.mean(weight_logits, axis=-1, keepdims=True)) # batch x k
                 entropy = nn.logsumexp(weight_logits, axis=-1, keepdims=True) - \
                     jnp.sum(nn.softmax(weight_logits, axis=-1) * weight_logits, axis=-1, keepdims=True) # batch x 1
