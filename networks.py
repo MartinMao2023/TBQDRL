@@ -513,16 +513,13 @@ class GC_GMM_PPO_Policy(nn.Module):
 
 
 
-class GC_Student_PPO_Policy(nn.Module):
+class GC_GMM_critic(nn.Module):
     """
-    Goal-conditioned GMM PPO policy module.
+    Goal-conditioned GMM critic module.
     """
 
     hidden_layer_sizes: Tuple[int, ...]
-    action_dim: int
     component_num: int
-    initial_std: jnp.ndarray
-    learnable_std: bool = False
     activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
     kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
     final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = nn.tanh
@@ -530,7 +527,6 @@ class GC_Student_PPO_Policy(nn.Module):
     kernel_init_final: Optional[Callable[..., Any]] = None
     has_z: bool = True
     component_means: jax.Array = None
-
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
@@ -552,14 +548,13 @@ class GC_Student_PPO_Policy(nn.Module):
         else:
             kernel_init = self.kernel_init
 
-
         if self.component_means is not None:
             mean_bias_init = nn.initializers.constant(self.component_means)
         else:
             mean_bias_init = nn.initializers.zeros_init()
 
-        action_mean = nn.Dense(
-            self.action_dim * self.component_num,
+        value_means = nn.Dense(
+            self.component_num,
             kernel_init=kernel_init,
             use_bias=True,
             bias_init=mean_bias_init,
@@ -571,30 +566,12 @@ class GC_Student_PPO_Policy(nn.Module):
             use_bias=self.bias,
         )(hidden)
 
-
         if self.final_activation is not None:
-            action_mean = self.final_activation(action_mean)
+            value_means = self.final_activation(value_means)
+        
+        value_mean = jnp.sum(value_means * nn.softmax(weights_logits, axis=-1), axis=-1, keepdims=True)
 
-        if self.learnable_std:
-            std_logits = self.param(
-                'std_logits', 
-                nn.initializers.constant(0.0), 
-                (self.action_dim,)
-            )
-        else:
-            std_logits = self.param(
-                'std_logits', 
-                nn.initializers.constant(0.0), 
-                (self.action_dim,)
-            )
-
-        new_shape = obs.shape[:-1] + (self.component_num, self.action_dim)
-        action_mean = jnp.reshape(action_mean, new_shape) # (?, k, d)
-        action_mean = jnp.sum(
-            action_mean * nn.softmax(weights_logits)[..., None], 
-            axis=-2,
-        )
-        return action_mean, std_logits
+        return value_mean
 
 
 

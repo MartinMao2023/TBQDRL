@@ -1,5 +1,4 @@
 import jax
-jax.config.update("jax_debug_nans", True)
 import flax.linen as nn
 import jax.numpy as jnp
 # from wrappers import AutoResetWrapper
@@ -13,22 +12,22 @@ from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
 # from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
 # from algorithms.qd_ppo import QDPPO, QDPPOConfigs, QDPPOTrainingState
+# from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
 from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
-from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
+from networks import GCMLP, GC_PPO_Policy, GC_GMM_critic
 # from functools import partial
 from flax import serialization
-# from task_wrappers.go2_wrapper import Go2Wrapper
 from task_wrappers.ant_wrapper import AntWrapper
 from data_struct.states import GeneralizedState
-from robots import go2
 
 
 vec_env = 4096
 mini_batch_size = 8192
-num_iterations = 2000
+num_iterations = 4000
 policy_epochs = 4
 critic_epochs = 4
+# policy_learning_rate_per_std = 1e-3 # unified
 policy_learning_rate_per_std = 1e-3 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
@@ -54,6 +53,7 @@ description_text = "\n".join(
 
 wandb.init(
     entity="airl-lab",
+    group="GMM tests",
     project="TBQDRL",
     config=description,
 )
@@ -75,9 +75,9 @@ ppo_config = PPOConfigs(
     policy_learnng_rate_per_std=policy_learning_rate_per_std,
     critic_learning_rate=critic_learning_rate,
     clip_ratio=0.2,
-    entropy_gain=0.005,
-    discount=0.996,
-    td_lambda_discount=0.98,
+    entropy_gain=0.001,
+    discount=0.99,
+    td_lambda_discount=0.95,
     rollout_length=rollout_length,
     vec_env=vec_env,
     mini_batch_size=mini_batch_size,
@@ -86,18 +86,17 @@ ppo_config = PPOConfigs(
 )
 
 
-seed = 8848
-# seed = 42
+# seed = 8848
+seed = 4242
 loop_random_key = jax.random.PRNGKey(seed)
 
-# # creat environment (Go2)
-env = envs.create('ant', episode_length=4096, backend="mjx", auto_reset=True)
-# env = Go2Wrapper(env)
+# # creat environment (Ant)
+env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
 env = AntWrapper(env)
 
 structure = "simple"
-critic_hidden_layers: Tuple[int, ...] = (64, 64)
-actor_hidden_layers: Tuple[int, ...] = (64, 64)
+critic_hidden_layers: Tuple[int, ...] = (128, 128)
+actor_hidden_layers: Tuple[int, ...] = (256, 256)
 policy_network = GC_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
@@ -106,7 +105,7 @@ policy_network = GC_PPO_Policy(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.softplus,
     final_activation=jnp.tanh,
-    learnable_std=False,
+    learnable_std=True,
 )
 
 critic_network = GCMLP(
@@ -117,11 +116,15 @@ critic_network = GCMLP(
     # final_activation=lambda x: x,
 )
 
-# fitness_critic_network = GCMLP(
-#     layer_sizes=critic_hidden_layers + (1,),
+loop_random_key, subkey = jax.random.split(loop_random_key)
+
+# critic_network = GC_GMM_critic(
+#     hidden_layer_sizes=critic_hidden_layers,
+#     component_num=8,
 #     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
 #     activation=nn.softplus,
 #     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+#     component_means=jax.random.normal(subkey, 8) * 0.05
 # )
 
 ppo = PPO(
@@ -129,13 +132,13 @@ ppo = PPO(
     policy_network=policy_network,
     critic_network=critic_network,
     ppo_configs=ppo_config,
-    std_anneal_fn=lambda x: jnp.maximum(0.05, 0.25 - x * 1e-4),
+    std_anneal_fn=lambda x: jnp.maximum(0.05, 0.5 - x * 1e-4),
 )
 
 loop_random_key, subkey = jax.random.split(loop_random_key)
 ppo_training_state = ppo.init(subkey)
 
-seed = 8848
+seed = 114514
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
@@ -216,14 +219,6 @@ for i in range(int(num_iterations / log_period)):
         })
 
     carry = (states, ppo_training_state, loop_random_key)
-
-    print(
-        jnp.mean(iteration_critic_error),
-        jnp.mean(iteration_approx_kl),
-        jnp.mean(iteration_clip_fraction),
-        jnp.mean(iteration_mean_return),
-        jnp.mean(iteration_mean_v),
-    )
 
 # (
 #     final_states, 

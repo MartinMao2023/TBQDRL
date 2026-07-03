@@ -49,6 +49,7 @@ description_text = "\n".join(
 
 wandb.init(
     entity="airl-lab",
+    group="GMM tests",
     project="TBQDRL",
     config=description,
 )
@@ -115,13 +116,6 @@ critic_network = GCMLP(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     # final_activation=lambda x: x,
 )
-
-# fitness_critic_network = GCMLP(
-#     layer_sizes=critic_hidden_layers + (1,),
-#     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
-#     activation=nn.softplus,
-#     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
-# )
 
 ppo = PPO(
     env=env,

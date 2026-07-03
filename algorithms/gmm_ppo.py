@@ -47,6 +47,10 @@ class  PPOTrainingState(PyTreeNode):
     current_std: jax.Array
     iteration_num: int
 
+    moving_mean: float
+    moving_squared_diff : float
+    lr_ratio: float
+
 
 
 class RolloutMetrics(PyTreeNode):
@@ -315,6 +319,9 @@ class PPO:
             critic_opt_state=critic_opt_state,
             current_std=current_std,
             iteration_num=0,
+            moving_mean=0.0,
+            moving_squared_diff=1.0,
+            lr_ratio=1.0,
             )
 
         return training_state
@@ -349,31 +356,33 @@ class PPO:
             length=self.configs.policy_epochs,
         )
 
+        lr_ratio = training_state.lr_ratio * 0.9
+        new_lr_ratio = jnp.where(final_approx_kl > 0.0125, lr_ratio, 0.1 + lr_ratio)
+
         # annealing
-        iteration_num = training_state.iteration_num + 1
         std_logits = policy_params['params']['std_logits']
         current_std = self._std_selection_fn(
             std_logits,
-            self._std_anneal_fn(iteration_num),
+            self._std_anneal_fn(training_state.iteration_num),
             )
         rms_std = jnp.sqrt(jnp.mean(current_std**2))
 
-        # current_learning_rate = rms_std * self._lr_per_std
-        current_learning_rate = jnp.clip(rms_std * self._lr_per_std, 5e-5, 5e-4)
+        current_learning_rate = jnp.clip(rms_std * self._lr_per_std * new_lr_ratio, max=3e-4)
         policy_opt_state = policy_opt_state._replace(
             hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
         )
 
-        new_training_state = PPOTrainingState(
+        new_training_state = training_state.replace(
             policy_params=policy_params,
             critic_params=critic_params,
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
             current_std=current_std,
-            iteration_num=iteration_num,
+            lr_ratio=new_lr_ratio,
         )
+
         training_data = TrainingMetrics(
-            critic_error=final_critic_error,
+            critic_error=final_critic_error * jnp.sqrt(training_state.moving_squared_diff),
             approx_kl=final_approx_kl,
             clip_fraction=final_clip_fraction,
             )
@@ -566,7 +575,9 @@ class PPO:
         final_obs, final_zs = self._env.get_obs(final_states)
 
         final_v = self._critic_network.apply(training_state.critic_params, final_obs, final_zs)
+        final_v = final_v * jnp.sqrt(training_state.moving_squared_diff) + training_state.moving_mean
         v_values = self.calculate_v(training_state.critic_params, transitions)
+        v_values = v_values * jnp.sqrt(training_state.moving_squared_diff) + training_state.moving_mean
 
         td_lambda_returns, weights = self.calculate_td_lambda_returns(
             final_v,
@@ -575,6 +586,12 @@ class PPO:
             transitions.dones,
             transitions.truncations,
             ) # rollout x parallelize
+        
+        iteration_num = training_state.iteration_num + 1
+        alpha = 1 / iteration_num
+        new_mean = training_state.moving_mean * (1 - alpha) + jnp.mean(td_lambda_returns) * alpha
+        new_squard_diff = training_state.moving_squared_diff * (1 - alpha) + \
+            jnp.mean(jnp.square(td_lambda_returns - new_mean)) * alpha
         
         gaes = self._process_gaes(td_lambda_returns - v_values)
 
@@ -587,6 +604,9 @@ class PPO:
             final_v,
             transitions,
         )
+        transitions = transitions.replace(
+            td_lambda_returns=(td_lambda_returns - new_mean) / (1e-6 + jnp.sqrt(new_squard_diff)),
+            )
         
         key, subkey = jax.random.split(key)
         transitions = transitions.shuffle(subkey)
@@ -600,6 +620,12 @@ class PPO:
                 ),
             ),
             transitions)
+        
+        training_state = training_state.replace(
+            iteration_num=iteration_num,
+            moving_mean=new_mean,
+            moving_squared_diff=new_squard_diff,
+        )
         
         new_training_state, training_data = self.state_update(training_state, transitions)
         aux_data = AuxData(rollout_data=rollout_data, training_data=training_data)

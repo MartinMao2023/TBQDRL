@@ -12,7 +12,8 @@ from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
 # from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
 # from algorithms.qd_ppo import QDPPO, QDPPOConfigs, QDPPOTrainingState
-from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
+# from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
+from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
 from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
 # from functools import partial
@@ -52,6 +53,7 @@ description_text = "\n".join(
 
 wandb.init(
     entity="airl-lab",
+    # group="",
     project="TBQDRL",
     config=description,
 )
@@ -93,7 +95,7 @@ env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset
 env = AntWrapper(env)
 
 structure = "simple"
-critic_hidden_layers: Tuple[int, ...] = (64, 64)
+critic_hidden_layers: Tuple[int, ...] = (128, 128)
 actor_hidden_layers: Tuple[int, ...] = (256, 256)
 policy_network = GC_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,

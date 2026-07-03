@@ -11,7 +11,7 @@ from datetime import datetime
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
 # from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
-# from algorithms.qd_ppo import QDPPO, QDPPOConfigs, QDPPOTrainingState
+# from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
 from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
 from networks import GCMLP, GC_PPO_Policy, ComplexGCMLP, ComplexGCPPO_Policy
@@ -24,7 +24,7 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 8192
-num_iterations = 10000
+num_iterations = 5000
 policy_epochs = 4
 critic_epochs = 4
 # policy_learning_rate_per_std = 1e-3 # unified
@@ -95,7 +95,7 @@ env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset
 env = AntMOWrapper(env)
 
 structure = "simple"
-critic_hidden_layers: Tuple[int, ...] = (64, 64)
+critic_hidden_layers: Tuple[int, ...] = (128, 128)
 actor_hidden_layers: Tuple[int, ...] = (256, 256)
 policy_network = GC_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
@@ -235,6 +235,8 @@ with open(folder_path + f"/policy.msgpack", "wb") as f:
 with open(folder_path + f"/critic.msgpack", "wb") as f:
     f.write(critic_bytes)
 
+jnp.save(folder_path + "/mean.npy", final_ppo_training_state.moving_mean)
+jnp.save(folder_path + "/var.npy", final_ppo_training_state.moving_squared_diff)
 
 wandb.finish()
 

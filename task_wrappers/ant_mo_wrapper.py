@@ -72,6 +72,21 @@ class AntMOWrapper(BaseTaskWrapper):
             z=jnp.concatenate([initial_action, preference])
             )
     
+    
+    def resample_task_state(self, state: GeneralizedState) -> GeneralizedState:
+        """resample task state"""
+        key, subkey = jax.random.split(state.key)
+        state_info = self._extract_state_info_for_task(state.env_state)
+        last_action = state.z_state.last_action
+        new_preference = self._init_task_state(state_info, subkey).preference
+        
+        new_z_state = state.z_state.replace(
+            preference=new_preference,
+            z=jnp.concatenate([last_action, new_preference])
+        )
+        state = state.replace(z_state=new_z_state, key=key)
+        return state
+    
 
     def get_obs(self, state):
         return state.env_state.obs, state.z_state.z
