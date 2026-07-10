@@ -87,7 +87,7 @@ ppo_config = PPOConfigs(
 
 
 # seed = 8848
-seed = 4242
+seed = 3745629
 loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
@@ -236,8 +236,6 @@ for i in range(int(num_iterations / log_period)):
 # with open(folder_path + f"/critic_{structure}.msgpack", "wb") as f:
 #     f.write(critic_bytes)
 
-# with open(folder_path + f"/fitness_critic_{structure}.msgpack", "wb") as f:
-#     f.write(fitness_critic_bytes)
 
 wandb.finish()
 

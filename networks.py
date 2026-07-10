@@ -372,16 +372,84 @@ class GC_PPO_Policy(nn.Module):
 
         if self.learnable_std:
             std_logits = self.param(
-                'std_logits', 
-                nn.initializers.constant(0.0), 
+                'std_logits',
+                nn.initializers.constant(0.0),
                 (self.action_dim,)
             )
         else:
             std_logits = self.param(
-                'std_logits', 
-                nn.initializers.constant(0.0), 
+                'std_logits',
+                nn.initializers.constant(0.0),
                 (self.action_dim,)
             )
+        return action_mean, std_logits
+
+
+class GC_PPO_Policy_Dropout(nn.Module):
+    """Goal-conditioned PPO policy with inverted dropout on hidden activations.
+
+    Mirrors ``GC_PPO_Policy`` exactly (same ``Dense`` layers and the same
+    ``std_logits`` parameter, dropout adds no parameters), so a parameter tree
+    trained for ``GC_PPO_Policy`` can be applied here unchanged.
+
+    With ``deterministic=False`` and a ``dropout`` RNG supplied via
+    ``apply(..., rngs={'dropout': key})``, a fraction ``dropout_rate`` of the
+    post-activation neurons is masked and the kept activations are upscaled by
+    ``1 / (1 - dropout_rate)`` (standard inverted dropout).  With
+    ``deterministic=True`` the forward pass is identical to ``GC_PPO_Policy``.
+    """
+
+    hidden_layer_sizes: Tuple[int, ...]
+    action_dim: int
+    initial_std: jnp.ndarray
+    dropout_rate: float = 0.0
+    learnable_std: bool = False
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = nn.tanh
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+
+    @nn.compact
+    def __call__(
+        self, obs: jnp.ndarray, z: jnp.ndarray, deterministic: bool = True,
+    ) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
+        for hidden_size in self.hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+            hidden = nn.Dropout(
+                self.dropout_rate, deterministic=deterministic,
+            )(hidden)
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        action_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(hidden)
+
+        if self.final_activation is not None:
+            action_mean = self.final_activation(action_mean)
+
+        std_logits = self.param(
+            'std_logits',
+            nn.initializers.constant(0.0),
+            (self.action_dim,)
+        )
         return action_mean, std_logits
     
 

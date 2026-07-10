@@ -81,6 +81,7 @@ class GMMDistillationBC:
         policy_network: GC_GMM_PPO_Policy,
         teacher_std_logits: jax.Array,
         bc_configs: GMMBCConfigs,
+        k: int = None,
     ):
         self._env = env
         self.configs = bc_configs
@@ -90,10 +91,15 @@ class GMMDistillationBC:
         teacher_inv_var = jnp.square(jnp.exp(-teacher_std_logits) + 1) # d
 
         component_num = policy_network.component_num
-        if (component_num % 2 != 0) or component_num < 2:
-            raise Exception("policy network must have even components")
+        if k is None:
+            k = component_num // 2  # default: half of the components
+        if not (1 <= k <= component_num - 1):
+            raise Exception(
+                f"k must be in [1, component_num - 1]; "
+                f"got k={k}, component_num={component_num}"
+            )
 
-        self.k = component_num // 2
+        self.k = k
 
 
         self.ema_alpha = jnp.exp(
@@ -163,9 +169,11 @@ class GMMDistillationBC:
 
             demonstrate_distances = jnp.square(action_means2[:, self.k:, :] - demonstrate_transitions.actions[:, None, :]) # B, k, d
             log_likelihoods = weight_logits2[:, self.k:] - 0.5 * jnp.sum(teacher_inv_var * demonstrate_distances, axis=-1) # B, k
-            log_likelihoods = nn.logsumexp(log_likelihoods, axis=-1, keepdims=False) \
-                - nn.logsumexp(weight_logits2[:, self.k:], axis=-1, keepdims=False) # B
-            nll = -jnp.mean(log_likelihoods)
+            log_likelihoods = nn.logsumexp(log_likelihoods, axis=-1, keepdims=True) \
+                - nn.logsumexp(weight_logits2[:, self.k:], axis=-1, keepdims=True) # B, 1
+            # advantage-weighted NLL: weights carry the per-sample advantage
+            # (filled with ones for now; relocate will provide real advantages)
+            nll = -jnp.mean(demonstrate_transitions.weights * log_likelihoods)
 
             log_weight_ratio1 = nn.logsumexp(weight_logits1[:, :self.k], axis=-1) - nn.logsumexp(weight_logits1[:, self.k:], axis=-1) # B
             log_weight_ratio2 = nn.logsumexp(weight_logits2[:, :self.k], axis=-1) - nn.logsumexp(weight_logits2[:, self.k:], axis=-1) # B
