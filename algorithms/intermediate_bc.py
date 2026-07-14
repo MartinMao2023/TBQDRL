@@ -181,11 +181,16 @@ class GMMDistillationBC:
             weight_regularize_loss = 0.5 * jnp.mean(
                 sigmoid_binary_cross_entropy(log_weight_ratio1, 0.5) + sigmoid_binary_cross_entropy(log_weight_ratio2, 0.5)
             )
+            # weight_regularize_loss = 0.5 * jnp.mean(
+            #     sigmoid_binary_cross_entropy(log_weight_ratio1, 0.0) + sigmoid_binary_cross_entropy(log_weight_ratio2, 0.0)
+            # )
             average_diff = 0.5 * (jnp.mean(
                 jnp.abs(nn.sigmoid(log_weight_ratio1) - 0.5) + jnp.abs(nn.sigmoid(log_weight_ratio2) - 0.5)
                 ))
 
-            return kl + nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
+            # return kl + nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
+            # return nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
+            return kl + weight_regularize_loss, jnp.array([kl, nll, average_diff])
         
 
         self._gmm_distillation_loss_fn = gmm_distillation_loss_fn

@@ -37,7 +37,7 @@ def calculate_coefs_for_trunk(
 
     Returns:
         reward_coefs: jax.Array shape of (total_length, 1)
-        value_coefs: jax.Array shape of (total_length +1, 1)
+        value_coefs: jax.Array shape of (total_length + 1, 1)
     """
 
     v_coefs = np.zeros((total_length + 1, 1))
@@ -232,3 +232,51 @@ def build_dropout_rollout(
     return rollout_fn
 
 
+
+
+
+
+def calculate_coefs_for_trajectory(
+    total_length: int, 
+    start_index: int,
+    end_index: int,
+    l: float,
+    discount: float = 0.99,
+    td_lambda_discount: float = 0.95,
+    ) -> Tuple[jax.Array, jax.Array]:
+    """
+    Args:
+        total_length: total number of transitions
+        start_index: starting index of the state sequence
+        end_index: final index of the state sequence, maximum value is total_length
+
+    Returns:
+        reward_coefs: jax.Array shape of (total_length, 1)
+        value_coefs: jax.Array shape of (total_length + 1, 1)
+    """
+
+    log_discount = jnp.log(td_lambda_discount * discount)
+    trunk_length = end_index - start_index
+    v_condition = (start_index <= jnp.arange(total_length + 1)) & (jnp.arange(total_length + 1) < end_index + 1)
+    reward_condition = (start_index <= jnp.arange(total_length)) & (jnp.arange(total_length) < end_index)
+
+    v_coefs = discount / (1 - discount * td_lambda_discount) * (
+        1 - jnp.exp(log_discount * (jnp.arange(total_length + 1) - start_index))
+        ) * (1 - td_lambda_discount) - 1.0 # (total_length + 1,)
+    
+    v_coefs = jnp.where(jnp.arange(total_length + 1) < end_index, v_coefs, 0.0)
+    smoothing_coefs = jnp.exp(-(jnp.arange(total_length + 1) - end_index)**2/l**2)
+    smoothing_coefs = jnp.where(v_condition, smoothing_coefs, 0.0)
+    smoothing_coefs = smoothing_coefs / (jnp.sum(smoothing_coefs) + 1e-6)
+    v_coefs = smoothing_coefs * discount / (1 - discount * td_lambda_discount) * (
+        1 - jnp.exp(log_discount * trunk_length)) + v_coefs
+
+    reward_coefs = jnp.arange(total_length) - start_index # (total_length,)
+    reward_coefs = (1 - jnp.exp(log_discount * reward_coefs + log_discount)) / (1 - discount * td_lambda_discount)
+    reward_coefs = jnp.where(
+        reward_condition,
+        reward_coefs,
+        0.0,
+    ) # (total_length,)
+
+    return reward_coefs[:, None], v_coefs[:, None]
