@@ -152,7 +152,7 @@ class PPO:
                 action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
 
                 log_likelihoods = weight_logits - jnp.sum(
-                    jnp.log(action_std) + 0.5 * jnp.square(action - action_means) / (action_std**2 + 1e-6), 
+                    jnp.log(action_std + 1e-6) + 0.5 * jnp.square(action - action_means) / (action_std**2 + 1e-6), 
                     axis=-1,
                     )# shape of (k,)
                 
@@ -251,7 +251,7 @@ class PPO:
                 transitions: PPOTransition,
                 std: jnp.ndarray,
             ) -> float:
-                
+
                 action_means, weight_logits, _ = policy_network.apply(policy_params, transitions.obs, transitions.zs)
 
                 weight_logits = weight_logits - jax.lax.stop_gradient(jnp.mean(weight_logits, axis=-1, keepdims=True)) # batch x k
@@ -499,26 +499,15 @@ class PPO:
     )
     def calculate_v(
         self,
-        critic_params: Params, 
+        critic_params: Params,
         transitions: PPOTransition,
     ) -> jnp.ndarray:
-        
-        def scan_calculate_v(
-            transition: PPOTransition,
-        ) -> Tuple[None, jnp.ndarray]:
-            
-            v_value = self._critic_network.apply(
-                critic_params, transition.obs, transition.zs
-                )
-            return None, v_value
-
-        _, v_values = jax.lax.scan(
-            lambda _, x: jax.vmap(scan_calculate_v)(x),
-            None,
-            transitions,
-            )
-        
-        return v_values
+        # Batched apply over all (rollout_length, vec_env) elements at once.
+        # Output shape: (rollout_length, vec_env, 1) — same as the previous
+        # scan+vmap path, since the critic's final op is sum(..., axis=-1, keepdims=True).
+        return self._critic_network.apply(
+            critic_params, transitions.obs, transitions.zs
+        )
     
 
     @partial(

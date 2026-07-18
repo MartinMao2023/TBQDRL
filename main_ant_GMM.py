@@ -10,7 +10,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from datetime import datetime
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
-from algorithms.gmm_ppo import PPO, PPOConfigs, PPOTrainingState
+from algorithms.test_gmm_ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
 from networks import GCMLP, GC_GMM_PPO_Policy
 # from functools import partial
@@ -21,7 +21,7 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 8192
-num_iterations = 4000
+num_iterations = 1000
 policy_epochs = 4
 critic_epochs = 4
 policy_learning_rate_per_std = 8e-4 # unified

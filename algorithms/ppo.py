@@ -48,6 +48,8 @@ class  PPOTrainingState(PyTreeNode):
 
     moving_mean: float
     moving_squared_diff : float
+    moving_mse: float
+    lr_ratio: float
 
 
 
@@ -274,7 +276,7 @@ class PPO:
             )
         
         rms_std = jnp.sqrt(jnp.mean(current_std**2))
-        current_learning_rate = rms_std * self._lr_per_std
+        current_learning_rate = jnp.clip(rms_std * self._lr_per_std, max=3e-4)
         policy_opt_state = policy_opt_state._replace(
             hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
         )
@@ -288,6 +290,8 @@ class PPO:
             iteration_num=0,
             moving_mean=0.0,
             moving_squared_diff=1.0,
+            moving_mse=0.0,
+            lr_ratio=1.0,
             )
 
         return training_state
@@ -322,6 +326,9 @@ class PPO:
             length=self.configs.policy_epochs,
         )
 
+        lr_ratio = training_state.lr_ratio * 0.9
+        new_lr_ratio = jnp.where(final_approx_kl > 0.0125, lr_ratio, 0.1 + lr_ratio)
+
         # annealing
         std_logits = policy_params['params']['std_logits']
         current_std = self._std_selection_fn(
@@ -330,7 +337,7 @@ class PPO:
             )
         rms_std = jnp.sqrt(jnp.mean(current_std**2))
 
-        current_learning_rate = rms_std * self._lr_per_std
+        current_learning_rate = jnp.clip(rms_std * self._lr_per_std * new_lr_ratio, max=3e-4)
         policy_opt_state = policy_opt_state._replace(
             hyperparams={**policy_opt_state.hyperparams, 'learning_rate': current_learning_rate}
         )
@@ -341,6 +348,7 @@ class PPO:
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
             current_std=current_std,
+            lr_ratio=new_lr_ratio,
         )
         
         training_data = TrainingMetrics(
@@ -549,13 +557,17 @@ class PPO:
             transitions.truncations,
             ) # rollout x parallelize
         
+        
         iteration_num = training_state.iteration_num + 1
         alpha = 1 / iteration_num
+        alpha_clipped = jnp.clip(alpha, min=0.05)
         new_mean = training_state.moving_mean * (1 - alpha) + jnp.mean(td_lambda_returns) * alpha
         new_squard_diff = training_state.moving_squared_diff * (1 - alpha) + \
             jnp.mean(jnp.square(td_lambda_returns - new_mean)) * alpha
+        raw_gaes = td_lambda_returns - v_values
+        new_mse = training_state.moving_mse * (1 - alpha_clipped) + jnp.mean(jnp.square(raw_gaes)) * alpha_clipped
         
-        gaes = self._process_gaes(td_lambda_returns - v_values)
+        gaes = self._process_gaes(raw_gaes)
         transitions = transitions.replace(
             td_lambda_returns=td_lambda_returns,
             gaes=gaes,
@@ -565,8 +577,14 @@ class PPO:
             final_v,
             transitions,
         )
+
+        critic_target = jnp.clip(
+            td_lambda_returns, 
+            min=v_values - 3 * jnp.sqrt(new_mse),
+            max=v_values + 3 * jnp.sqrt(new_mse),
+            )
         transitions = transitions.replace(
-            td_lambda_returns=(td_lambda_returns - new_mean) / (1e-6 + jnp.sqrt(new_squard_diff)),
+            td_lambda_returns=(critic_target - new_mean) / (1e-6 + jnp.sqrt(new_squard_diff)),
             )
         
         key, subkey = jax.random.split(key)
@@ -586,6 +604,7 @@ class PPO:
             iteration_num=iteration_num,
             moving_mean=new_mean,
             moving_squared_diff=new_squard_diff,
+            moving_mse=new_mse,
         )
         
         new_training_state, training_data = self.state_update(training_state, transitions)

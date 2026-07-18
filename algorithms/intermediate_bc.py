@@ -26,6 +26,11 @@ class GMMBCConfigs:
     # tracking.  Set this to match (buffer_size // mini_batch_size) at the
     # call site so the EMA behaves like a per-epoch running average.
     num_mini_batches: int = 16
+    # Ablation: if True, drop the teacher-KL term and the component-balance
+    # regularizer, and fit ALL 2k components to the relocated demonstrations
+    # via the advantage-weighted NLL. The GMMDistillationTransition argument is
+    # then ignored by the loss.
+    relocate_only: bool = False
 
 
 class GMMBCTrainingState(PyTreeNode):
@@ -93,13 +98,14 @@ class GMMDistillationBC:
         component_num = policy_network.component_num
         if k is None:
             k = component_num // 2  # default: half of the components
-        if not (1 <= k <= component_num - 1):
+        if not (1 <= k <= component_num):
             raise Exception(
-                f"k must be in [1, component_num - 1]; "
+                f"k must be in [1, component_num]; "
                 f"got k={k}, component_num={component_num}"
             )
 
         self.k = k
+        self.relocate_only = bc_configs.relocate_only
 
 
         self.ema_alpha = jnp.exp(
@@ -192,8 +198,49 @@ class GMMDistillationBC:
             # return nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
             return kl + weight_regularize_loss, jnp.array([kl, nll, average_diff])
         
+        def gmm_distillation_nll(
+            policy_params: Params,
+            transitions: Tuple[GMMDistillationTransition, PPOTransition],
+            key: RNGKey,
+        ) -> Tuple[float, float]:
+            """Divergence loss between the teacher GMM and the student GMM.
 
-        self._gmm_distillation_loss_fn = gmm_distillation_loss_fn
+            Args:
+                policy_params:  Student policy parameters.
+                transitions:    Mini-batch of ``GMMDistillationTransition``,
+                                carrying the teacher's component means and
+                                weight_logits for each state.
+                key:            Random key
+
+            Returns:
+                (loss, aux): scalar loss to differentiate through, and an
+                auxiliary scalar for metric tracking (e.g. the same loss or
+                a secondary diagnostic).
+            """
+            gmm_transitions, demonstrate_transitions = transitions
+            # Ablation: fit ALL 2k components to the relocated demonstrations
+            # via advantage-weighted NLL only (no teacher KL, no balance
+            # regularizer). gmm_transitions is ignored by this branch.
+            action_means2, weight_logits2, _ = policy_network.apply(
+                policy_params,
+                demonstrate_transitions.obs,
+                demonstrate_transitions.zs,
+            )  # B, 2k, d ; B, 2k
+            demonstrate_distances = jnp.square(
+                action_means2 - demonstrate_transitions.actions[:, None, :]
+            )  # B, 2k, d
+            log_likelihoods = weight_logits2 - 0.5 * jnp.sum(
+                teacher_inv_var * demonstrate_distances, axis=-1
+            )  # B, 2k
+            log_likelihoods = nn.logsumexp(log_likelihoods, axis=-1, keepdims=True) \
+                - nn.logsumexp(weight_logits2, axis=-1, keepdims=True)  # B, 1
+            nll = -jnp.mean(demonstrate_transitions.weights * log_likelihoods)
+            return nll, jnp.array([0.0, nll, 0.0])
+        
+        if self.relocate_only:
+            self._gmm_distillation_loss_fn = gmm_distillation_nll
+        else:
+            self._gmm_distillation_loss_fn = gmm_distillation_loss_fn
 
     # -----------------------------------------------------------------------
     # Initialisation

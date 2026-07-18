@@ -2,6 +2,7 @@ import numpy as np
 import numpy.linalg as lg
 import jax
 import jax.numpy as jnp
+import flax.linen as nn
 from typing import Any, Tuple
 
 from custom_types import RNGKey
@@ -118,6 +119,13 @@ def build_on_policy_rollout(env, policy_network, policy_params, rollout_length):
     ) -> Tuple[GeneralizedState, MORelocationTransition]:
 
         action_std = jax.nn.sigmoid(policy_params["params"]["std_logits"])
+        # Teacher (Gaussian PPO) log-prob helpers: log p_teacher(a) of the
+        # sampled action, recorded in `log_likelihood` for the two-stage
+        # distiller's importance-sampling stage. Drop 2*pi; include the
+        # log-variance term (-sum log_std). std is shared, so this is the
+        # single-Gaussian limit of the GMM log-likelihood formula.
+        teacher_log_std = nn.log_sigmoid(policy_params["params"]["std_logits"])
+        teacher_inv_var = jnp.exp(-2.0 * teacher_log_std)
 
         def play_step_fn(carry):
             state, key = carry
@@ -130,18 +138,29 @@ def build_on_policy_rollout(env, policy_network, policy_params, rollout_length):
 
             last_action = state.z_state.last_action
 
+            # log p_teacher(action | obs, z) of the executed (clipped) action
+            log_likelihood = (
+                -0.5 * jnp.sum(
+                    teacher_inv_var * jnp.square(action - action_mean),
+                    axis=-1, keepdims=True,
+                )
+                - jnp.sum(teacher_log_std, axis=-1, keepdims=True)
+            )  # (1,)
+
             state, transition_info = env.step(state, action)
 
             transition = MORelocationTransition(
                 obs=obs,
                 zs=z,
                 actions=action,
+                # actions=action_mean,
                 last_actions=last_action,
                 mo_rewards=transition_info.mo_reward,
                 weights=jnp.zeros((1,)),
                 dones=transition_info.done,
                 truncations=transition_info.truncation,
                 td_lambda_returns=jnp.zeros((1,)),
+                log_likelihood=log_likelihood,
             )
             return (state, key), transition
 
@@ -183,6 +202,12 @@ def build_dropout_rollout(
     ) -> Tuple[GeneralizedState, MORelocationTransition]:
 
         action_std = jax.nn.sigmoid(policy_params["params"]["std_logits"])
+        # Teacher log-prob helpers (same convention as build_on_policy_rollout):
+        # for the dropout rollout the "policy making the demonstration" is the
+        # dropout-perturbed teacher, so log p is evaluated at the
+        # dropout-perturbed action_mean (computed per step below).
+        teacher_log_std = nn.log_sigmoid(policy_params["params"]["std_logits"])
+        teacher_inv_var = jnp.exp(-2.0 * teacher_log_std)
 
         # One dropout key per env, held constant for the whole rollout so the
         # same dropout-perturbed ("mutated") policy is used at every step.
@@ -206,18 +231,29 @@ def build_dropout_rollout(
 
             last_action = state.z_state.last_action
 
+            # log p of the executed action under the dropout-perturbed teacher
+            log_likelihood = (
+                -0.5 * jnp.sum(
+                    teacher_inv_var * jnp.square(action - action_mean),
+                    axis=-1, keepdims=True,
+                )
+                - jnp.sum(teacher_log_std, axis=-1, keepdims=True)
+            )  # (1,)
+
             state, transition_info = env.step(state, action)
 
             transition = MORelocationTransition(
                 obs=obs,
                 zs=z,
                 actions=action,
+                # actions=action_mean,
                 last_actions=last_action,
                 mo_rewards=transition_info.mo_reward,
                 weights=jnp.zeros((1,)),
                 dones=transition_info.done,
                 truncations=transition_info.truncation,
                 td_lambda_returns=jnp.zeros((1,)),
+                log_likelihood=log_likelihood,
             )
             # dropout_key is carried through unchanged
             return (state, key, dropout_key), transition

@@ -307,6 +307,8 @@ relocated_demonstrations = relocate(
     combined_final_info,
     critic_network=critic_network,
     critic_params=critic_params,
+    moving_mean=moving_mean,
+    moving_std=moving_std,
     config=relocation_config,
     key=subkey,
 )

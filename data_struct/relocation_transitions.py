@@ -34,6 +34,7 @@ class MORelocationTransition(flax.struct.PyTreeNode):
         dones            (..., 1)
         truncations      (..., 1)
         td_lambda_returns(..., 1)               filled in Stage 1/3
+        log_likelihood  (..., 1)               log p_teacher(a) of the sampled action
     """
 
     obs: Observation
@@ -45,6 +46,10 @@ class MORelocationTransition(flax.struct.PyTreeNode):
     dones: jax.Array
     truncations: jax.Array
     td_lambda_returns: jax.Array
+    # log p_teacher(a | obs, z): the teacher (Gaussian PPO) log-prob of the
+    # sampled action, recorded so the two-stage distiller can use it as the
+    # old_log_likelihood of the importance-sampling stage.
+    log_likelihood: jax.Array
 
     # ------------------------------------------------------------------
     # Shape properties
@@ -78,6 +83,7 @@ class MORelocationTransition(flax.struct.PyTreeNode):
             + 1                        # dones
             + 1                        # truncations
             + 1                        # td_lambda_returns
+            + 1                        # log_likelihood
         )
 
     # ------------------------------------------------------------------
@@ -98,6 +104,7 @@ class MORelocationTransition(flax.struct.PyTreeNode):
                 self.dones,
                 self.truncations,
                 self.td_lambda_returns,
+                self.log_likelihood,
             ],
             axis=-1,
         ).reshape(-1, self.flatten_dim)
@@ -138,6 +145,8 @@ class MORelocationTransition(flax.struct.PyTreeNode):
         truncations = flattened_transition[:, cursor : cursor + 1]
         cursor += 1
         td_lambda_returns = flattened_transition[:, cursor : cursor + 1]
+        cursor += 1
+        log_likelihood = flattened_transition[:, cursor : cursor + 1]
 
         return cls(
             obs=obs,
@@ -149,6 +158,7 @@ class MORelocationTransition(flax.struct.PyTreeNode):
             dones=dones,
             truncations=truncations,
             td_lambda_returns=td_lambda_returns,
+            log_likelihood=log_likelihood,
         )
 
     @classmethod
@@ -170,6 +180,7 @@ class MORelocationTransition(flax.struct.PyTreeNode):
             dones=jnp.zeros(shape=(1, 1)),
             truncations=jnp.zeros(shape=(1, 1)),
             td_lambda_returns=jnp.zeros(shape=(1, 1)),
+            log_likelihood=jnp.zeros(shape=(1, 1)),
         )
 
     def shuffle(self, key: RNGKey) -> "MORelocationTransition":

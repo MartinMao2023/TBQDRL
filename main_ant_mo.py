@@ -207,6 +207,10 @@ for i in range(int(num_iterations / log_period)):
 
     carry = (states, ppo_training_state, loop_random_key)
 
+    if jnp.mean(iteration_mean_return) > 200:
+        print("early break!")
+        break
+
 
 # =================================
 #      Save model parameters
@@ -222,7 +226,7 @@ model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
 critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
 
 
-folder_path = f"./output/MORL/test"
+folder_path = f"./output/MORL/test2"
 
 if not os.path.exists(folder_path):
     os.makedirs(folder_path, exist_ok=True)
