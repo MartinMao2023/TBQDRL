@@ -151,12 +151,12 @@ class PPO:
                 # safe box:
                 action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
 
-                log_likelihoods = weight_logits - jnp.sum(
-                    jnp.log(action_std) + 0.5 * jnp.square(action - action_means) / (action_std**2 + 1e-6), 
+                log_likelihoods = weight_logits - 0.5 * jnp.sum(
+                    jnp.square(action - action_means) / (action_std**2 + 1e-6), 
                     axis=-1,
-                    )# shape of (k,)
+                    ) # shape of (k,)
                 
-                log_likelihood = nn.logsumexp(log_likelihoods)
+                log_likelihood = nn.logsumexp(log_likelihoods) - jnp.sum(jnp.log(action_std + 1e-6))
                 log_likelihood = log_likelihood - nn.logsumexp(weight_logits)
                 
                 state, transition_info = env.step(state, action)
@@ -230,9 +230,9 @@ class PPO:
 
                 new_log_likelihoods = weight_logits - 0.5 * jnp.sum(
                     jnp.square(jnp.exp(-std_logits) + 1) * (jnp.square(action_means - transitions.actions[:, None, :]) + 1e-4), 
-                    axis=-1) - std_entropy # batch x k
+                    axis=-1) # batch x k
                 
-                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) # batch x 1
+                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) - std_entropy # batch x 1
                 new_log_likelihood = new_log_likelihood - nn.logsumexp(weight_logits, axis=-1, keepdims=True) # batch x 1
                 
                 log_ratio = new_log_likelihood - transitions.log_likelihood
@@ -251,18 +251,18 @@ class PPO:
                 transitions: PPOTransition,
                 std: jnp.ndarray,
             ) -> float:
-                
+
                 action_means, weight_logits, _ = policy_network.apply(policy_params, transitions.obs, transitions.zs)
 
                 weight_logits = weight_logits - jax.lax.stop_gradient(jnp.mean(weight_logits, axis=-1, keepdims=True)) # batch x k
                 selection_entropy = nn.logsumexp(weight_logits, axis=-1, keepdims=True) - \
                     jnp.sum(nn.softmax(weight_logits, axis=-1) * weight_logits, axis=-1, keepdims=True) # batch x 1
 
-                new_log_likelihoods = weight_logits - jnp.sum(
-                    jnp.log(std) + 0.5 * jnp.square(action_means - transitions.actions[:, None, :]) / (std**2 + 1e-6), 
+                new_log_likelihoods = weight_logits - 0.5 * jnp.sum(
+                    jnp.square(action_means - transitions.actions[:, None, :]) / (std**2 + 1e-6), 
                     axis=-1) # batch x k
                 
-                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) # batch x 1
+                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) - jnp.sum(jnp.log(std + 1e-6)) # batch x 1
                 new_log_likelihood = new_log_likelihood - nn.logsumexp(weight_logits, axis=-1, keepdims=True) # batch x 1
                 
                 log_ratio = new_log_likelihood - transitions.log_likelihood
@@ -499,26 +499,15 @@ class PPO:
     )
     def calculate_v(
         self,
-        critic_params: Params, 
+        critic_params: Params,
         transitions: PPOTransition,
     ) -> jnp.ndarray:
-        
-        def scan_calculate_v(
-            transition: PPOTransition,
-        ) -> Tuple[None, jnp.ndarray]:
-            
-            v_value = self._critic_network.apply(
-                critic_params, transition.obs, transition.zs
-                )
-            return None, v_value
-
-        _, v_values = jax.lax.scan(
-            lambda _, x: jax.vmap(scan_calculate_v)(x),
-            None,
-            transitions,
-            )
-        
-        return v_values
+        # Batched apply over all (rollout_length, vec_env) elements at once.
+        # Output shape: (rollout_length, vec_env, 1) — same as the previous
+        # scan+vmap path, since the critic's final op is sum(..., axis=-1, keepdims=True).
+        return self._critic_network.apply(
+            critic_params, transitions.obs, transitions.zs
+        )
     
 
     @partial(

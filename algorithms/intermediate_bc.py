@@ -194,9 +194,9 @@ class GMMDistillationBC:
                 jnp.abs(nn.sigmoid(log_weight_ratio1) - 0.5) + jnp.abs(nn.sigmoid(log_weight_ratio2) - 0.5)
                 ))
 
-            # return kl + nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
+            return kl + nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
             # return nll + weight_regularize_loss, jnp.array([kl, nll, average_diff])
-            return kl + weight_regularize_loss, jnp.array([kl, nll, average_diff])
+            # return kl + weight_regularize_loss, jnp.array([kl, nll, average_diff])
         
         def gmm_distillation_nll(
             policy_params: Params,

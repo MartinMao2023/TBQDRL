@@ -581,6 +581,317 @@ class GC_GMM_PPO_Policy(nn.Module):
 
 
 
+class GC_multi_Policy(nn.Module):
+    """
+    Goal-conditioned multi-mean policy. Outputs GMM component means and std
+    only (no selection head). Used together with GC_Selector so the action
+    means and the component weights are produced by independent networks.
+    """
+
+    hidden_layer_sizes: Tuple[int, ...]
+    action_dim: int
+    component_num: int
+    learnable_std: bool = False
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = nn.tanh
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+    component_means: jax.Array = None
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
+        for hidden_size in self.hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        if self.component_means is not None:
+            mean_bias_init = nn.initializers.constant(self.component_means)
+        else:
+            mean_bias_init = nn.initializers.zeros_init()
+
+        action_mean = nn.Dense(
+            self.action_dim * self.component_num,
+            kernel_init=kernel_init,
+            use_bias=True,
+            bias_init=mean_bias_init,
+        )(hidden)
+
+        if self.final_activation is not None:
+            action_mean = self.final_activation(action_mean)
+
+        std_logits = self.param(
+            'std_logits',
+            nn.initializers.constant(0.0),
+            (self.action_dim,),
+        )
+
+        new_shape = obs.shape[:-1] + (self.component_num, self.action_dim)
+        return jnp.reshape(action_mean, new_shape), std_logits
+
+
+
+class GC_Selector(nn.Module):
+    """
+    Goal-conditioned selector network. Outputs GMM component weight logits
+    (no final softmax). Independent trunk from the action policy.
+    """
+
+    hidden_layer_sizes: Tuple[int, ...]
+    component_num: int
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
+        for hidden_size in self.hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        weight_logits = nn.Dense(
+            self.component_num,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(hidden)
+
+        return weight_logits
+
+
+
+class GC_combined_multi_Policy(nn.Module):
+    """
+    Goal-conditioned multi-mean policy with a Y-shaped hidden.
+
+    (obs, z) is projected through a single shared hidden of size
+    ``shared_hidden_size``, then forks into two independent hidden layers of
+    size ``split_hidden_size``: branch A feeds the first ``k1`` component means
+    (teacher-aligned), branch B the remaining ``component_num - k1`` means
+    (relocated/demo). The two groups of means are concatenated back along the
+    component axis into the full ``(component_num, action_dim)`` matrix. The
+    shared trunk keeps a common feature representation while the two branch
+    hiddens decouple the weights of the two component groups, reducing gradient
+    interference between the KL-aligned and the NLL/IS-fit components.
+
+    ``k1`` should match the distillation's ``k1``; it is not asserted here
+    since the concatenation restores the full ``component_num`` regardless.
+
+    Returns ``(action_means (..., component_num, action_dim), std_logits (action_dim,))``.
+    """
+
+    shared_hidden_layer_sizes: Tuple[int, ...]
+    split_hidden_layer_sizes: Tuple[int, ...]
+    action_dim: int
+    component_num: int
+    k1: int
+    learnable_std: bool = False
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = nn.tanh
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+    component_means: jax.Array = None
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
+        # Shared trunk.
+        for hidden_size in self.shared_hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        k1 = self.k1
+        k2 = self.component_num - k1
+
+        if self.component_means is not None:
+            cm = self.component_means.reshape(self.component_num, self.action_dim)
+            bias_a = nn.initializers.constant(cm[:k1].reshape(-1))
+            bias_b = nn.initializers.constant(cm[k1:].reshape(-1))
+        else:
+            bias_a = bias_b = nn.initializers.zeros_init()
+
+        # Branch A: shared trunk -> independent split hidden(s) -> first k1 means.
+        h_a = hidden
+        for hidden_size in self.split_hidden_layer_sizes:
+            h_a = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(h_a)
+            h_a = self.activation(h_a)  # type: ignore
+        mean_a = nn.Dense(
+            k1 * self.action_dim,
+            kernel_init=kernel_init,
+            use_bias=True,
+            bias_init=bias_a,
+        )(h_a)
+
+        # Branch B: shared trunk -> independent split hidden(s) -> remaining k2 means.
+        h_b = hidden
+        for hidden_size in self.split_hidden_layer_sizes:
+            h_b = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(h_b)
+            h_b = self.activation(h_b)  # type: ignore
+        mean_b = nn.Dense(
+            k2 * self.action_dim,
+            kernel_init=kernel_init,
+            use_bias=True,
+            bias_init=bias_b,
+        )(h_b)
+
+        if self.final_activation is not None:
+            mean_a = self.final_activation(mean_a)
+            mean_b = self.final_activation(mean_b)
+
+        new_shape_a = obs.shape[:-1] + (k1, self.action_dim)
+        new_shape_b = obs.shape[:-1] + (k2, self.action_dim)
+        action_mean = jnp.concatenate(
+            [jnp.reshape(mean_a, new_shape_a), jnp.reshape(mean_b, new_shape_b)],
+            axis=-2,
+        )
+
+        std_logits = self.param(
+            'std_logits',
+            nn.initializers.constant(0.0),
+            (self.action_dim,),
+        )
+
+        return action_mean, std_logits
+
+
+class GC_combined_Selector(nn.Module):
+    """
+    Goal-conditioned selector with a Y-shaped hidden.
+
+    (obs, z) is projected through a single shared hidden of size
+    ``shared_hidden_size``, then forks into two independent hidden layers of
+    size ``split_hidden_size``: branch A feeds the first ``k1`` component
+    weight logits, branch B the remaining ``component_num - k1``. The two
+    groups are concatenated back along the component axis, decoupling the
+    weights of the two component groups while sharing the feature-learning
+    trunk.
+
+    ``k1`` should match the distillation's ``k1``; it is not asserted here
+    since the concatenation restores the full ``component_num`` regardless.
+
+    Returns ``weight_logits (..., component_num)`` (no final softmax).
+    """
+
+    shared_hidden_layer_sizes: Tuple[int, ...]
+    split_hidden_layer_sizes: Tuple[int, ...]
+    component_num: int
+    k1: int
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+    has_z: bool = True
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        if self.has_z:
+            hidden = jnp.concatenate([obs, z], axis=-1)
+        else:
+            hidden = obs
+
+        # Shared trunk.
+        for hidden_size in self.shared_hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        k1 = self.k1
+        k2 = self.component_num - k1
+
+        # Branch A: shared trunk -> independent split hidden(s) -> first k1 logits.
+        h_a = hidden
+        for hidden_size in self.split_hidden_layer_sizes:
+            h_a = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(h_a)
+            h_a = self.activation(h_a)  # type: ignore
+        logits_a = nn.Dense(
+            k1,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(h_a)
+
+        # Branch B: shared trunk -> independent split hidden(s) -> remaining k2 logits.
+        h_b = hidden
+        for hidden_size in self.split_hidden_layer_sizes:
+            h_b = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(h_b)
+            h_b = self.activation(h_b)  # type: ignore
+        logits_b = nn.Dense(
+            k2,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(h_b)
+
+        return jnp.concatenate([logits_a, logits_b], axis=-1)
+
+
 class GC_GMM_critic(nn.Module):
     """
     Goal-conditioned GMM critic module.

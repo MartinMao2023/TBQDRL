@@ -14,7 +14,7 @@ from data_struct.states import GeneralizedState
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
 from task_wrappers.base import BaseTaskWrapper
-from networks import GC_GMM_PPO_Policy
+from networks import GC_multi_Policy, GC_Selector
 
 
 
@@ -22,6 +22,7 @@ from networks import GC_GMM_PPO_Policy
 class PPOConfigs:
     policy_learnng_rate_per_std: float = 1e-3 # learning_rate per std
     critic_learning_rate: float = 5e-4
+    selector_learning_rate: float = 1e-4
     clip_ratio: float = 0.2
     entropy_gain: float = 0.01
     selection_entropy_gain: float = 0.0
@@ -41,9 +42,11 @@ class  PPOTrainingState(PyTreeNode):
 
     policy_params: Params
     critic_params: Params
+    selector_params: Params
 
     policy_opt_state: optax.OptState
     critic_opt_state: optax.OptState
+    selector_opt_state: optax.OptState
 
     current_std: jax.Array
     iteration_num: int
@@ -80,7 +83,8 @@ class PPO:
     def __init__(
         self,
         env: BaseTaskWrapper,
-        policy_network: GC_GMM_PPO_Policy,
+        policy_network: GC_multi_Policy,
+        selector_network: GC_Selector,
         critic_network: nn.Module,
         ppo_configs: PPOConfigs,
         std_anneal_fn: Callable,
@@ -96,6 +100,7 @@ class PPO:
         self.ema_alpha = jnp.exp(-2 / self.mini_batch_num)
 
         self._policy_network = policy_network
+        self._selector_network = selector_network
         self._critic_network = critic_network
         self._lr_per_std = ppo_configs.policy_learnng_rate_per_std
 
@@ -115,6 +120,9 @@ class PPO:
         self._critic_optimizer = optax.adam(
             learning_rate=ppo_configs.critic_learning_rate,
         )
+        self._selector_optimizer = optax.adam(
+            learning_rate=ppo_configs.selector_learning_rate,
+        )
 
 
         if policy_network.learnable_std:
@@ -126,6 +134,7 @@ class PPO:
         @jax.jit
         def rollout_fn(
             policy_params: Params,
+            selector_params: Params,
             starting_states: GeneralizedState,
             keys: RNGKey,
             std: jax.Array,
@@ -137,7 +146,8 @@ class PPO:
                 
                 state, sampled_state, l, key = carry
                 obs, z = env.get_obs(state)
-                action_means, weight_logits, _ = policy_network.apply(policy_params, obs, z)
+                action_means, _ = policy_network.apply(policy_params, obs, z)
+                weight_logits = selector_network.apply(selector_params, obs, z)
 
                 action_std = std
 
@@ -151,12 +161,12 @@ class PPO:
                 # safe box:
                 action = jnp.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
 
-                log_likelihoods = weight_logits - jnp.sum(
-                    jnp.log(action_std + 1e-6) + 0.5 * jnp.square(action - action_means) / (action_std**2 + 1e-6), 
+                log_likelihoods = weight_logits - 0.5 * jnp.sum(
+                    jnp.square(action - action_means) / (action_std**2 + 1e-6), 
                     axis=-1,
                     )# shape of (k,)
                 
-                log_likelihood = nn.logsumexp(log_likelihoods)
+                log_likelihood = nn.logsumexp(log_likelihoods) - jnp.sum(jnp.log(action_std + 1e-6))
                 log_likelihood = log_likelihood - nn.logsumexp(weight_logits)
                 
                 state, transition_info = env.step(state, action)
@@ -217,11 +227,13 @@ class PPO:
         if policy_network.learnable_std:
             def policy_loss_fn(
                 policy_params: Params,
+                selector_params: Params,
                 transitions: PPOTransition,
                 std: jnp.ndarray,
             ) -> float:
 
-                action_means, weight_logits, std_logits = policy_network.apply(policy_params, transitions.obs, transitions.zs)
+                action_means, std_logits = policy_network.apply(policy_params, transitions.obs, transitions.zs)
+                weight_logits = selector_network.apply(selector_params, transitions.obs, transitions.zs)
 
                 std_entropy = jnp.sum(nn.log_sigmoid(std_logits), axis=-1, keepdims=True) # (1,)
                 selection_entropy = nn.logsumexp(weight_logits, axis=-1, keepdims=True) - \
@@ -230,9 +242,9 @@ class PPO:
 
                 new_log_likelihoods = weight_logits - 0.5 * jnp.sum(
                     jnp.square(jnp.exp(-std_logits) + 1) * (jnp.square(action_means - transitions.actions[:, None, :]) + 1e-4), 
-                    axis=-1) - std_entropy # batch x k
+                    axis=-1) # batch x k
                 
-                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) # batch x 1
+                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) - std_entropy # batch x 1
                 new_log_likelihood = new_log_likelihood - nn.logsumexp(weight_logits, axis=-1, keepdims=True) # batch x 1
                 
                 log_ratio = new_log_likelihood - transitions.log_likelihood
@@ -248,21 +260,23 @@ class PPO:
         else:
             def policy_loss_fn(
                 policy_params: Params,
+                selector_params: Params,
                 transitions: PPOTransition,
                 std: jnp.ndarray,
             ) -> float:
 
-                action_means, weight_logits, _ = policy_network.apply(policy_params, transitions.obs, transitions.zs)
+                action_means, _ = policy_network.apply(policy_params, transitions.obs, transitions.zs)
+                weight_logits = selector_network.apply(selector_params, transitions.obs, transitions.zs)
 
                 weight_logits = weight_logits - jax.lax.stop_gradient(jnp.mean(weight_logits, axis=-1, keepdims=True)) # batch x k
                 selection_entropy = nn.logsumexp(weight_logits, axis=-1, keepdims=True) - \
                     jnp.sum(nn.softmax(weight_logits, axis=-1) * weight_logits, axis=-1, keepdims=True) # batch x 1
 
-                new_log_likelihoods = weight_logits - jnp.sum(
-                    jnp.log(std) + 0.5 * jnp.square(action_means - transitions.actions[:, None, :]) / (std**2 + 1e-6), 
+                new_log_likelihoods = weight_logits - 0.5 * jnp.sum(
+                    jnp.square(action_means - transitions.actions[:, None, :]) / (std**2 + 1e-6), 
                     axis=-1) # batch x k
                 
-                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) # batch x 1
+                new_log_likelihood = nn.logsumexp(new_log_likelihoods, axis=-1, keepdims=True) - jnp.sum(jnp.log(std + 1e-6)) # batch x 1
                 new_log_likelihood = new_log_likelihood - nn.logsumexp(weight_logits, axis=-1, keepdims=True) # batch x 1
                 
                 log_ratio = new_log_likelihood - transitions.log_likelihood
@@ -293,6 +307,10 @@ class PPO:
         policy_opt_state = self._policy_optimizer.init(policy_params)
 
         key, subkey = jax.random.split(key)
+        selector_params = self._selector_network.init(subkey, obs=fake_obs, z=fake_zs)
+        selector_opt_state = self._selector_optimizer.init(selector_params)
+
+        key, subkey = jax.random.split(key)
         critic_params = self._critic_network.init(subkey, obs=fake_obs, z=fake_zs)
         critic_opt_state = self._critic_optimizer.init(critic_params)
 
@@ -311,8 +329,10 @@ class PPO:
         training_state = PPOTrainingState(
             policy_params=policy_params,
             critic_params=critic_params,
+            selector_params=selector_params,
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
+            selector_opt_state=selector_opt_state,
             current_std=current_std,
             iteration_num=0,
             moving_mean=0.0,
@@ -343,13 +363,17 @@ class PPO:
             length=self.configs.critic_epochs,
         )
 
-        (policy_params, policy_opt_state, final_approx_kl, final_clip_fraction), _ = jax.lax.scan(
+        (policy_params, policy_opt_state,
+         selector_params, selector_opt_state,
+         final_approx_kl, final_clip_fraction), _ = jax.lax.scan(
             lambda x, _: partial(
                 self.train_policy, 
                 transitions=transitions, 
                 std=training_state.current_std,
                 )(x),
-            (training_state.policy_params, training_state.policy_opt_state, 0.0, 0.0),
+            (training_state.policy_params, training_state.policy_opt_state,
+             training_state.selector_params, training_state.selector_opt_state,
+             0.0, 0.0),
             length=self.configs.policy_epochs,
         )
 
@@ -372,8 +396,10 @@ class PPO:
         new_training_state = training_state.replace(
             policy_params=policy_params,
             critic_params=critic_params,
+            selector_params=selector_params,
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
+            selector_opt_state=selector_opt_state,
             current_std=current_std,
             lr_ratio=new_lr_ratio,
         )
@@ -393,25 +419,27 @@ class PPO:
     )
     def train_policy(
         self,
-        carry: Tuple[Params, optax.OptState, float, float],
+        carry: Tuple[Params, optax.OptState, Params, optax.OptState, float, float],
         transitions: PPOTransition,
         std: jnp.ndarray,
-        ) -> Tuple[Tuple[Params, optax.OptState, float, float], Any]:
+        ) -> Tuple[Tuple[Params, optax.OptState, Params, optax.OptState, float, float], Any]:
         """
-        perform one epoch training of policy network
+        perform one epoch training of policy and selector networks
         """
 
         def scan_train_policy(carry, transition_data):
             (
                 current_policy_params, 
                 current_policy_opt_state,
+                current_selector_params,
+                current_selector_opt_state,
                 current_approx_kl,
                 current_clip_fraction,
                 ) = carry
 
-            policy_gradient, (approx_kl, clip_fraction) = jax.grad(
-                self._policy_loss_fn, has_aux=True
-                )(current_policy_params, transition_data, std)
+            (policy_gradient, selector_gradient), (approx_kl, clip_fraction) = jax.grad(
+                self._policy_loss_fn, has_aux=True, argnums=(0, 1)
+                )(current_policy_params, current_selector_params, transition_data, std)
     
             new_approx_kl = approx_kl * (1 - self.ema_alpha) + \
                 self.ema_alpha * current_approx_kl
@@ -422,9 +450,15 @@ class PPO:
                 policy_gradient, current_policy_opt_state)
             new_policy_params = optax.apply_updates(current_policy_params, policy_updates)
 
+            selector_updates, new_selector_opt_state = self._selector_optimizer.update(
+                selector_gradient, current_selector_opt_state)
+            new_selector_params = optax.apply_updates(current_selector_params, selector_updates)
+
             new_carry = (
                 new_policy_params, 
                 new_policy_opt_state,
+                new_selector_params,
+                new_selector_opt_state,
                 new_approx_kl,
                 new_clip_fraction,
             )
@@ -554,6 +588,7 @@ class PPO:
             final_states, sampled_states, transitions
             ) = self._rollout_fn(
                 training_state.policy_params, 
+                training_state.selector_params,
                 starting_states, 
                 subkeys, 
                 training_state.current_std,

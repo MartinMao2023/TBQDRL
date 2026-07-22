@@ -10,7 +10,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from datetime import datetime
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
-from algorithms.test_gmm_ppo import PPO, PPOConfigs, PPOTrainingState
+from algorithms.gmm_ppo import PPO, PPOConfigs, PPOTrainingState
 # from data_struct.transitions import PPOTransition
 from networks import GCMLP, GC_GMM_PPO_Policy
 # from functools import partial
