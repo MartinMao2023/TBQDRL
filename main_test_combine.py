@@ -11,7 +11,7 @@ from flax import serialization
 
 from typing import Tuple
 from custom_types import Params, RNGKey
-from networks import GC_PPO_Policy, GC_combined_multi_Policy, GC_combined_Selector, GCMLP
+from networks import GC_PPO_Policy, GC_combined_multi_Policy, GC_combined_Selector, GCMLP, GC_multi_Policy, GC_Selector
 from task_wrappers.ant_mo_wrapper import AntMOWrapper
 from tools import (
     build_on_policy_rollout,
@@ -28,6 +28,7 @@ from data_struct import (
 
 from algorithms.combined_distill import CombinedDistill, CombinedDistillConfigs
 from algorithms.test_gmm_ppo import PPO, PPOConfigs
+# from algorithms.warmup_gmm_ppo import PPO, PPOConfigs
 # from algorithms.test_ppo import PPO, PPOConfigs
 
 
@@ -81,12 +82,12 @@ critic_network = GCMLP(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
 )
 
-seed = 42
+seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 
-folder_path = "output/MORL/test2"
-# folder_path = "output/MORL/test"
+# folder_path = "output/MORL/test2"
+folder_path = "output/MORL/test"
 
 with open(folder_path + "/policy.msgpack", "rb") as f:
     encoded_bytes = f.read()
@@ -118,29 +119,49 @@ else:
     component_means = jnp.zeros(env.action_size)
 
 student_hidden_layers = (256, 256)
-student_action_network = GC_combined_multi_Policy(
-    shared_hidden_layer_sizes=(256,),
-    split_hidden_layer_sizes=(128,),
+# student_action_network = GC_combined_multi_Policy(
+#     shared_hidden_layer_sizes=(256,),
+#     split_hidden_layer_sizes=(128,),
+#     action_dim=env.action_size,
+#     component_num=component_num,
+#     k1=k1,
+#     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
+#     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+#     activation=nn.silu,
+#     final_activation=jnp.tanh,
+#     learnable_std=True,
+#     component_means=component_means,
+# )
+student_action_network = GC_multi_Policy(
+    hidden_layer_sizes=(256, 256),
     action_dim=env.action_size,
-    component_num=component_num,
-    k1=k1,
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.silu,
     final_activation=jnp.tanh,
     learnable_std=True,
-    component_means=component_means,
+    component_num=component_num,
+    component_means=component_means,   
 )
 
-student_selection_network = GC_combined_Selector(
-    shared_hidden_layer_sizes=(256,),
-    split_hidden_layer_sizes=(128,),
+
+# student_selection_network = GC_combined_Selector(
+#     shared_hidden_layer_sizes=(256,),
+#     split_hidden_layer_sizes=(128,),
+#     component_num=component_num,
+#     k1=k1,
+#     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
+#     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+#     activation=nn.silu,
+# )
+student_selection_network = GC_Selector(
+    hidden_layer_sizes=(256, 256),
     component_num=component_num,
-    k1=k1,
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.silu,
 )
+
 
 
 
@@ -217,38 +238,41 @@ if num_collect_iterations > 0:
 else:
     need_distill = False
 
+
+need_relocate = False
+
 if need_distill:
     print(combined_transitions.obs.shape)
     # ===========================================================================
     # Stage 3: relocation optimization -> relocated_demonstrations
     # ===========================================================================
-
-    loop_random_key, subkey = jax.random.split(loop_random_key)
-    relocated_demonstrations = relocate(
-        combined_transitions,
-        combined_final_info,
-        critic_network=critic_network,
-        critic_params=critic_params,
-        moving_mean=moving_mean,
-        moving_std=moving_std,
-        config=relocation_config,
-        key=subkey,
-        max_data_size=data_size,
-    )
-
-    # dummy = jnp.ones_like(combined_transitions.td_lambda_returns) # distill teacher
-    # relocated_demonstrations = PPOTransition(
-    #     obs=combined_transitions.obs,
-    #     actions=combined_transitions.actions,
-    #     zs=combined_transitions.zs,
-    #     log_likelihood=combined_transitions.log_likelihood,
-    #     rewards=dummy,
-    #     td_lambda_returns=dummy,
-    #     gaes=dummy,
-    #     dones=dummy,
-    #     truncations=dummy,
-    #     weights=dummy,
-    # )
+    if need_relocate:
+        loop_random_key, subkey = jax.random.split(loop_random_key)
+        relocated_demonstrations = relocate(
+            combined_transitions,
+            combined_final_info,
+            critic_network=critic_network,
+            critic_params=critic_params,
+            moving_mean=moving_mean,
+            moving_std=moving_std,
+            config=relocation_config,
+            key=subkey,
+            max_data_size=data_size,
+        )
+    else:
+        dummy = jnp.ones_like(combined_transitions.td_lambda_returns) # distill teacher
+        relocated_demonstrations = PPOTransition(
+            obs=combined_transitions.obs,
+            actions=combined_transitions.actions,
+            zs=combined_transitions.zs,
+            log_likelihood=combined_transitions.log_likelihood,
+            rewards=dummy,
+            td_lambda_returns=dummy,
+            gaes=dummy,
+            dones=dummy,
+            truncations=dummy,
+            weights=dummy,
+        )
 
 
 
@@ -389,17 +413,17 @@ selector_training_state = selector_training_state.replace(
 )
 
 # fresh key for the selector PPO phase (matches main_ant_GMM.py convention)
-seed = 42
+seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
-carry = (states, selector_training_state, loop_random_key)
+carry = (states, selector_training_state, loop_random_key, 0)
 
 
 @jax.jit
 def training_loop(carry, _):
-    states, selector_training_state, loop_random_key = carry
+    states, selector_training_state, loop_random_key, num = carry
 
     (final_states, _, selector_training_state, loop_random_key), aux_data = selector.train(
-        states, selector_training_state, loop_random_key,
+        states, selector_training_state, loop_random_key, 
     )
 
     resampled_states = jax.vmap(env.resample_task_state)(final_states)
@@ -412,7 +436,7 @@ def training_loop(carry, _):
         final_states,
     )
 
-    new_carry = (new_states, selector_training_state, loop_random_key)
+    new_carry = (new_states, selector_training_state, loop_random_key, num + 1)
     return new_carry, (
         aux_data.training_data.critic_error,
         aux_data.training_data.approx_kl,
@@ -423,7 +447,7 @@ def training_loop(carry, _):
 
 log_period = 10
 for i in range(int(num_iterations // log_period)):
-    (states, selector_training_state, loop_random_key), (
+    carry, (
         iteration_critic_error,
         iteration_approx_kl,
         iteration_clip_fraction,
@@ -437,6 +461,5 @@ for i in range(int(num_iterations // log_period)):
         "gated_return": jnp.mean(iteration_mean_return),
     })
     print("return", jnp.mean(iteration_mean_return))
-    carry = (states, selector_training_state, loop_random_key)
 
 wandb.finish()
