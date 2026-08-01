@@ -18,7 +18,8 @@ from tools import (
     build_dropout_rollout,
     with_policy_action_mean,
 )
-from algorithms.relocation import relocate
+# from algorithms.relocation import relocate
+from algorithms.cem_relocation import relocate
 from data_struct.states import GeneralizedState
 from data_struct import (
     MORelocationTransition,
@@ -44,7 +45,7 @@ critic_learning_rate = 5e-4
 ppo_rollout_length = 32
 # collection configs
 rollout_length = 64
-num_collect_iterations = 18 # <----------------    change to 8
+num_collect_iterations = 16 # <----------------    change to 8
 relocation_config = {
     # TODO: relocation hyperparameters (candidate preferences, advantage
     # threshold, segment length, etc.)
@@ -82,12 +83,12 @@ critic_network = GCMLP(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
 )
 
-seed = 8848
+seed = 4455
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 
-# folder_path = "output/MORL/test2"
-folder_path = "output/MORL/test"
+folder_path = "output/MORL/test2"
+# folder_path = "output/MORL/test"
 
 with open(folder_path + "/policy.msgpack", "rb") as f:
     encoded_bytes = f.read()
@@ -108,8 +109,9 @@ moving_mean = jnp.load(folder_path + "/mean.npy")
 moving_std = jnp.sqrt(jnp.load(folder_path + "/var.npy"))
 
 loop_random_key, subkey = jax.random.split(loop_random_key)
-component_num = 5
-k1 = 1
+k1 = 0
+k2 = 1
+component_num = k1 + k2
 if component_num > 1:
     component_means = jnp.concatenate([
         jnp.zeros(env.action_size),
@@ -169,10 +171,13 @@ teacher_std_logits = policy_params["params"]["std_logits"]
 teacher_std = jax.nn.sigmoid(teacher_std_logits)
 
 
-# with open("output/MORL/test/policy.msgpack", "rb") as f:
-#     encoded_bytes = f.read()
-# expert_params = serialization.from_bytes(policy_template, encoded_bytes)
-expert_params = policy_params
+expert_demo = False
+if expert_demo:
+    with open("output/MORL/test/policy.msgpack", "rb") as f:
+        encoded_bytes = f.read()
+    expert_params = serialization.from_bytes(policy_template, encoded_bytes)
+else:
+    expert_params = policy_params
 
 
 
@@ -261,10 +266,34 @@ if need_distill:
         )
     else:
         dummy = jnp.ones_like(combined_transitions.td_lambda_returns) # distill teacher
+
+        loop_random_key, subkey = jax.random.split(loop_random_key)
+
+        # # random sample
+        preference_part_1 = jax.random.normal(subkey, (num_collect_iterations, 64, vec_env, 2)) # <--- all independent
+        loop_random_key, subkey = jax.random.split(loop_random_key)
+        preference_part_2 = jnp.abs(jax.random.normal(subkey, (num_collect_iterations, 64, vec_env, 3))) # <--- all independent
+        # preferences = combined_transitions.zs[..., 8:] * 0.0 + jnp.concatenate([preference_part_1, preference_part_2], axis=-1)
+        preferences = jnp.concatenate([preference_part_1, preference_part_2], axis=-1)
+
+        # preference_noise = jax.random.normal(subkey, (num_collect_iterations, 1, vec_env, 5)) * 0.4
+        # preferences = combined_transitions.zs[..., 8:] # (18, 64, 4096, 5)
+        # preferences = jnp.clip(preferences + preference_noise, min=jnp.array([-100, -100, 0, 0, 0]))
+
+        # according to reward
+        # preferences = jnp.mean(combined_transitions.mo_rewards, axis=1, keepdims=True)
+        # preferences = combined_transitions.zs[..., 8:] * 0.0 + preferences
+
+        preferences = preferences / jnp.linalg.norm(preferences, axis=-1, keepdims=True)
+
+        new_zs = jnp.concatenate([combined_transitions.zs[..., :8], preferences], axis=-1)
+
+
         relocated_demonstrations = PPOTransition(
             obs=combined_transitions.obs,
             actions=combined_transitions.actions,
-            zs=combined_transitions.zs,
+            # zs=combined_transitions.zs,
+            zs=new_zs,
             log_likelihood=combined_transitions.log_likelihood,
             rewards=dummy,
             td_lambda_returns=dummy,
@@ -273,7 +302,6 @@ if need_distill:
             truncations=dummy,
             weights=dummy,
         )
-
 
 
 bc_configs = CombinedDistillConfigs(
@@ -340,7 +368,10 @@ if need_distill:
 
 
 
-
+if expert_demo:
+    group_name = "200 learn from 300"
+else:
+    group_name = "relocation combined"
 
 
 wandb_config = {
@@ -358,10 +389,12 @@ wandb_config = {
 }
 wandb.init(
     entity="airl-lab",
-    group="relocation combined",
+    group=group_name,
     project="TBQDRL",
     config=wandb_config,
 )
+
+print(f"k1: {k1}, component num: {component_num}")
 
 ppo_config = PPOConfigs(
     policy_learnng_rate_per_std=policy_learning_rate_per_std,
@@ -413,8 +446,8 @@ selector_training_state = selector_training_state.replace(
 )
 
 # fresh key for the selector PPO phase (matches main_ant_GMM.py convention)
-seed = 8848
-loop_random_key = jax.random.PRNGKey(seed)
+# seed = 8848
+# loop_random_key = jax.random.PRNGKey(seed)
 carry = (states, selector_training_state, loop_random_key, 0)
 
 

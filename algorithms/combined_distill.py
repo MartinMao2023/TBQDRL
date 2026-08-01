@@ -90,7 +90,7 @@ class CombinedDistill:
         k1 = bc_configs.k1
         if k1 is None:
             k1 = component_num // 2
-        if not (1 <= k1 < component_num):
+        if not (0 <= k1 < component_num):
             raise Exception(
                 f"k1 must be in [1, component_num); "
                 f"got k1={k1}, component_num={component_num}"
@@ -158,12 +158,12 @@ class CombinedDistill:
         ) -> Tuple[float, jax.Array]:
             gmm_t, demo_t = transitions
 
-            action_means1, _ = policy_network.apply(
-                policy_params, gmm_t.obs, gmm_t.zs
-            )  # B, K, d
-            w_logits1 = selector_network.apply(
-                selector_params, gmm_t.obs, gmm_t.zs
-            )  # B, K
+            # action_means1, _ = policy_network.apply(
+            #     policy_params, gmm_t.obs, gmm_t.zs
+            # )  # B, K, d
+            # w_logits1 = selector_network.apply(
+            #     selector_params, gmm_t.obs, gmm_t.zs
+            # )  # B, K
             action_means2, std_logits2 = policy_network.apply(
                 policy_params, demo_t.obs, demo_t.zs
             )  # B, K, d ; d
@@ -171,33 +171,33 @@ class CombinedDistill:
                 selector_params, demo_t.obs, demo_t.zs
             )  # B, K
 
-            # ---- KL: student first-k1 vs teacher (all components, teacher std) ----
-            student_means_k1 = action_means1[:, :k1]
-            student_w_k1 = w_logits1[:, :k1]
-            student_w_k1_sg = jax.lax.stop_gradient(student_w_k1)
-            # selector trained only through the bounded softmax weighting (not via log_q)
-            component_weights_k1 = nn.softmax(student_w_k1)     # B, k1
-            sampled = jax.random.normal(key, student_means_k1.shape) * teacher_std \
-                + student_means_k1                                        # B, k1, d  (non-sg: landing)
-            d_q = jnp.square(
-                sampled[:, :, None, :]
-                - jax.lax.stop_gradient(student_means_k1)[:, None, :, :]
-            )  # B, k1, k1, d
-            log_q = student_w_k1_sg[:, None, :] \
-                - 0.5 * jnp.sum(teacher_inv_var * d_q, axis=-1)     # B, k1, k1
-            d_p = jnp.square(
-                sampled[:, :, None, :] - gmm_t.action_means[:, None, :, :]
-            )  # B, k1, Kt, d
-            log_p = gmm_t.component_logits[:, None, :] \
-                - 0.5 * jnp.sum(teacher_inv_var * d_p, axis=-1)    # B, k1, Kt
-            log_ratio_kl = (
-                nn.logsumexp(log_q, axis=-1)
-                - nn.logsumexp(student_w_k1_sg, axis=-1, keepdims=True)
-            ) - (
-                nn.logsumexp(log_p, axis=-1)
-                - nn.logsumexp(gmm_t.component_logits, axis=-1, keepdims=True)
-            )  # B, k1
-            kl = jnp.mean(jnp.sum(log_ratio_kl * component_weights_k1, axis=-1))
+            # # ---- KL: student first-k1 vs teacher (all components, teacher std) ----
+            # student_means_k1 = action_means1[:, :k1]
+            # student_w_k1 = w_logits1[:, :k1]
+            # student_w_k1_sg = jax.lax.stop_gradient(student_w_k1)
+            # # selector trained only through the bounded softmax weighting (not via log_q)
+            # component_weights_k1 = nn.softmax(student_w_k1)     # B, k1
+            # sampled = jax.random.normal(key, student_means_k1.shape) * teacher_std \
+            #     + student_means_k1                                        # B, k1, d  (non-sg: landing)
+            # d_q = jnp.square(
+            #     sampled[:, :, None, :]
+            #     - jax.lax.stop_gradient(student_means_k1)[:, None, :, :]
+            # )  # B, k1, k1, d
+            # log_q = student_w_k1_sg[:, None, :] \
+            #     - 0.5 * jnp.sum(teacher_inv_var * d_q, axis=-1)     # B, k1, k1
+            # d_p = jnp.square(
+            #     sampled[:, :, None, :] - gmm_t.action_means[:, None, :, :]
+            # )  # B, k1, Kt, d
+            # log_p = gmm_t.component_logits[:, None, :] \
+            #     - 0.5 * jnp.sum(teacher_inv_var * d_p, axis=-1)    # B, k1, Kt
+            # log_ratio_kl = (
+            #     nn.logsumexp(log_q, axis=-1)
+            #     - nn.logsumexp(student_w_k1_sg, axis=-1, keepdims=True)
+            # ) - (
+            #     nn.logsumexp(log_p, axis=-1)
+            #     - nn.logsumexp(gmm_t.component_logits, axis=-1, keepdims=True)
+            # )  # B, k1
+            # kl = jnp.mean(jnp.sum(log_ratio_kl * component_weights_k1, axis=-1))
 
             # ---- Demo term on the back components (slice [:, k1:]) ----
             means_k2 = action_means2[:, k1:]                       # B, k2, d
@@ -217,28 +217,38 @@ class CombinedDistill:
                 - log_norm
             )  # B, 1
 
+            # new_log_p_k2 = - 0.5 * jnp.min(jnp.sum(
+            #     inv_var * jnp.square(means_k2 - demo_t.actions[:, None, :]),
+            #     axis=-1), axis=-1, keepdims=True) - log_norm # B, 1
+
             nll = -jnp.mean(demo_t.weights * new_log_p_k2)
             ratio = jnp.exp(new_log_p_k2 - demo_t.log_likelihood)   # B, 1
             ratio = jnp.minimum(max_ratio, ratio)
-            surrogate = -jnp.mean(demo_t.weights * ratio)
-            demo_term = (1.0 - beta) * nll + beta * surrogate
+
+            # ratio_sg = jax.lax.stop_gradient(ratio)
+            # surrogate = -jnp.mean(demo_t.weights * ratio)
+            # demo_term = (1.0 - beta) * nll + beta * surrogate
+            demo_term = nll # test
 
             # ---- Balance regularizer on the selector's weight_logits ----
-            log_wr1 = nn.logsumexp(w_logits1[:, :k1], axis=-1) \
-                - nn.logsumexp(w_logits1[:, k1:], axis=-1)         # B
-            log_wr2 = nn.logsumexp(w_logits2[:, :k1], axis=-1) \
-                - nn.logsumexp(w_logits2[:, k1:], axis=-1)         # B
-            balance = jnp.mean(
-                sigmoid_binary_cross_entropy(log_wr1, 0.5)
-                + sigmoid_binary_cross_entropy(log_wr2, 0.5)
-            )
+            # log_wr1 = nn.logsumexp(w_logits1[:, :k1], axis=-1) \
+            #     - nn.logsumexp(w_logits1[:, k1:], axis=-1)         # B
+            # log_wr2 = nn.logsumexp(w_logits2[:, :k1], axis=-1) \
+            #     - nn.logsumexp(w_logits2[:, k1:], axis=-1)         # B
+            # balance = jnp.mean(
+            #     sigmoid_binary_cross_entropy(log_wr1, 0.5)
+            #     + sigmoid_binary_cross_entropy(log_wr2, 0.5)
+            # )
 
-            average_diff = 0.5 * (jnp.mean(
-                jnp.abs(nn.sigmoid(log_wr1) - 0.5) + jnp.abs(nn.sigmoid(log_wr2) - 0.5)
-                ))
+            # average_diff = 0.5 * (jnp.mean(
+            #     jnp.abs(nn.sigmoid(log_wr1) - 0.5) + jnp.abs(nn.sigmoid(log_wr2) - 0.5)
+            #     ))
+            average_diff = 0.0 # <--- TO DO
+            kl = 0.0 # <--- TO DO
 
             # loss = kl + demo_term + 
-            loss = balance + demo_term + kl
+            # loss = balance + demo_term + kl # <--- TO DO
+            loss = demo_term # <--- TO DO
             return loss, jnp.array([kl, demo_term, average_diff])
 
         if fixed_beta is not None:

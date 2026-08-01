@@ -28,7 +28,7 @@ from functools import partial
 import jax.numpy as jnp
 import jax
 import numpy as np
-from tools import calculate_coefs_for_trajectory, calculate_coefs_by_trunk
+from tools import calculate_coefs_for_trajectory
 import flax.linen as nn
 
 
@@ -60,8 +60,8 @@ class Relocator:
         self.num_iters = config.get("num_iters", 256)
         self.n_global = config.get("num_global", 4)
         self.n_refine = config.get("num_refine", 4)
-        self.pref_std = config.get("pref_std", 0.2)
-        self.idx_radius = config.get("idx_radius", 12)
+        self.pref_std = config.get("pref_std", 0.1)
+        self.idx_radius = config.get("idx_radius", 8)
         self.s_min = config.get("s_min", 0)
         self.s_max = config.get("s_max", 48)
         self.min_len = config.get("min_len", 16)
@@ -69,25 +69,6 @@ class Relocator:
         self.chunk_size = config.get("chunk_size", 1024)
         self.n_cand = self.n_global + self.n_refine
         self.trunk_penalty = 10
-
-
-
-        def p_loss_fn(preference, mo_rewards_sum, v_coefs, all_obs, all_la):
-            preference = preference / (1e-6 + jnp.linalg.norm(preference))
-            zs = jnp.concatenate(
-                [all_la, jnp.tile(preference, (65, 1))], axis=-1
-            )
-            values = critic_network.apply(critic_params, all_obs, zs) \
-                * moving_std + moving_mean
-
-            # mo_rewards_sum shape: (5,)
-    
-            advantage = jnp.sum(mo_rewards_sum * preference) + jnp.sum(values * v_coefs) 
-    
-            return -advantage
-
-        self.p_loss_fn = p_loss_fn
-        
 
     # -------------------------------------------------- advantage evaluator
     def _eval_significant_advantage(
@@ -117,7 +98,7 @@ class Relocator:
             - length_penalty
         return advantage
 
-
+    # ----------------------------------------------------- candidate samplers
     @staticmethod
     def _project(x):
         """Map an unconstrained 5-vector onto the feasible preference patch:
@@ -125,34 +106,100 @@ class Relocator:
         x = jnp.concatenate([x[..., :2], jnp.abs(x[..., 2:])], axis=-1)
         return x / jnp.linalg.norm(x, axis=-1, keepdims=True)
 
+    def _sample_global(self, k, n):
+        kp, ks, ke = jax.random.split(k, 3)
+        p = self._project(jax.random.normal(kp, (n, 5)))
+        s = jax.random.randint(ks, (n,), self.s_min, self.s_max + 1)
+        e = jax.random.randint(ke, (n,), s + self.min_len, self.e_max + 1)
+        return p, s, e
+
+    def _sample_refine(self, k, best_p, best_s, best_e, n):
+        kp, ks, ke = jax.random.split(k, 3)
+        p = self._project(best_p + self.pref_std * jax.random.normal(kp, (n, 5)))
+        s_lo = jnp.maximum(best_s - self.idx_radius, self.s_min)
+        s_hi = jnp.minimum(best_s + self.idx_radius, self.s_max)
+        s = jax.random.randint(ks, (n,), s_lo, s_hi + 1)
+        e_lo = jnp.maximum(best_e - self.idx_radius, s + self.min_len)
+        e_hi = jnp.minimum(best_e + self.idx_radius, self.e_max)
+        e_hi = jnp.maximum(e_hi, e_lo)
+        e = jax.random.randint(ke, (n,), e_lo, e_hi + 1)
+        return p, s, e
 
     # ------------------------------------------------ per-trajectory search
+    def _optimize_one(self, all_obs_t, all_la_t, mo_rewards_t, key):
+        """num_iters random-search + refine for one trajectory.
 
-    def optimize_one(self, all_obs, all_la, all_mo_rewards):
-        starts_and_ends = jnp.array([
-            [0, 32],
-            [32, 64],
-            [16, 48],
-            [0, 64],
-        ], dtype=jnp.int32)
+        Returns (best_p, best_s, best_e, best_score).
+        """
+        def step(carry, _):
+            best_p, best_s, best_e, best_score, key = carry
+            key, k_gen, k_next = jax.random.split(key, 3)
+            kg, kr = jax.random.split(k_gen, 2)
 
-        def _get_reward_sum_and_v_coefs(start_and_end):
-            start, end = start_and_end
-            reward_coefs, v_coefs = calculate_coefs_for_trajectory(
-                64, start, end, 8, 0.99, 0.95
+            g_p, g_s, g_e = self._sample_global(kg, self.n_cand)
+            r_p, r_s, r_e = self._sample_refine(kr, best_p, best_s, best_e, self.n_refine)
+
+            mixed_p = jnp.concatenate([g_p[: self.n_global], r_p], axis=0)
+            mixed_s = jnp.concatenate([g_s[: self.n_global], r_s], axis=0)
+            mixed_e = jnp.concatenate([g_e[: self.n_global], r_e], axis=0)
+
+            below = best_score < self.threshold
+            p_batch = jnp.where(below, g_p, mixed_p)
+            s_batch = jnp.where(below, g_s, mixed_s)
+            e_batch = jnp.where(below, g_e, mixed_e)
+
+            scores = jax.vmap(
+                lambda p, s, e: self._eval_significant_advantage(
+                    p, s, e, mo_rewards_t, all_obs_t, all_la_t
+                )
+            )(p_batch, s_batch, e_batch)
+
+            idx = jnp.argmax(scores)
+            cand_score = scores[idx]
+            improved = cand_score > best_score
+            new_best_p = jnp.where(improved, p_batch[idx], best_p)
+            new_best_s = jnp.where(improved, s_batch[idx], best_s)
+            new_best_e = jnp.where(improved, e_batch[idx], best_e)
+            new_best_score = jnp.where(improved, cand_score, best_score)
+
+            return (new_best_p, new_best_s, new_best_e, new_best_score, k_next), None
+
+        init = (
+            jnp.zeros(5),
+            jnp.int32(self.s_min),
+            jnp.int32(self.e_max),
+            jnp.array(-jnp.inf, dtype=jnp.float32),
+            key,
+        )
+        carry, _ = jax.lax.scan(step, init, None, length=self.num_iters)
+        return carry[0], carry[1], carry[2], carry[3]
+
+    @partial(jax.jit, static_argnames=("self",))
+    def optimize_all(self, all_obs_c, all_la_c, mo_r_c, key):
+        """Scan over chunks of `chunk_size` trajectories (vmap inside each).
+
+        Args (chunked): all_obs_c, all_la_c, mo_r_c with leading axis
+            (num_chunks, chunk_size, ...).
+        Returns (best_p, best_s, best_e, best_score), each flattened to
+            (num_traj, ...).
+        """
+        def chunk_step(key, chunk):
+            ao, al, mr = chunk
+            key, subkey = jax.random.split(key)
+            bp, bs, be, bsc = jax.vmap(self._optimize_one)(
+                ao, al, mr, jax.random.split(subkey, ao.shape[0])
             )
+            return key, (bp, bs, be, bsc)
 
-            return jnp.sum(all_mo_rewards * reward_coefs, axis=0), v_coefs
-
-        reward_sums, v_coefs = jax.vmap(_get_reward_sum_and_v_coefs)(starts_and_ends)
-
-        # apply BFGS to optimize the p
-        # return tuple (starts_and_ends, ps)
-        # scan the trajectory
-
-
-        return
-    
+        _, (bp, bs, be, bsc) = jax.lax.scan(
+            chunk_step, key, (all_obs_c, all_la_c, mo_r_c)
+        )
+        num_traj = bp.shape[0] * bp.shape[1]
+        best_p = bp.reshape(num_traj, 5)
+        best_s = bs.reshape(num_traj)
+        best_e = be.reshape(num_traj)
+        best_score = bsc.reshape(num_traj)
+        return best_p, best_s, best_e, best_score
 
     # ------------------------------------------------- per-step GAE (placeholder)
     def calculate_td_lambda_return(
@@ -378,10 +425,10 @@ class Relocator:
         final_obs, final_last_actions = final_info
         all_obs = jnp.concatenate(
             [transitions.obs, jnp.expand_dims(final_obs, 1)], axis=1
-        ) # (num_iter, 65, vec_env, obs_dim)
+        )  # (num_iter, 65, vec_env, obs_dim)
         all_last_actions = jnp.concatenate(
             [transitions.last_actions, jnp.expand_dims(final_last_actions, 1)], axis=1
-        ) # (num_iter, 65, vec_env, obs_dim)
+        )
 
         num_iter, rollout_len, n_env = transitions.obs.shape[:3]
         num_traj = num_iter * n_env
@@ -402,9 +449,35 @@ class Relocator:
         dones_t = to_traj(transitions.dones)
         truncs_t = to_traj(transitions.truncations)
 
+        all_obs_c = all_obs_t.reshape(
+            num_chunks, self.chunk_size, *all_obs_t.shape[1:]
+        )
+        all_la_c = all_la_t.reshape(
+            num_chunks, self.chunk_size, *all_la_t.shape[1:]
+        )
+        mo_r_c = mo_r_t.reshape(num_chunks, self.chunk_size, *mo_r_t.shape[1:])
 
+        key, opt_key, gae_key, shuf_key = jax.random.split(key, 4)
+        best_p, best_s, best_e, best_score = self.optimize_all(
+            all_obs_c, all_la_c, mo_r_c, opt_key
+        )
 
-        return 
+        # ---- per-step GAE of the selected trunks ----
+        # v_values (N, 65, 1), rewards (N, 64, 1) under the best preference.
+        v_values, rewards = self._compute_values(all_obs_t, all_la_t, mo_r_t, best_p)
+        # time-major (T+1, B, 1) / (T, B, 1) for the reverse scan + vmap.
+        v_tm = jnp.transpose(v_values, (1, 0, 2))      # (65, N, 1)
+        r_tm = jnp.transpose(rewards, (1, 0, 2))        # (64, N, 1)
+        td_lambda_return = self.calculate_td_lambda_return(
+            v_tm, r_tm, best_e
+        )  # (64, N, 1)
+        gae_tm = jnp.clip(td_lambda_return - v_tm[:-1], min=0)  # (64, N, 1)
+        gae_t = jnp.transpose(gae_tm, (1, 0, 2))         # (N, 64, 1)
+
+        return self.reorganize(
+            obs_t, la_t, act_t, ll_t, dones_t, truncs_t,
+            best_p, best_s, best_e, best_score, gae_t, shuf_key, max_data_size,
+        )
 
 
 def relocate(
