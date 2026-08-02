@@ -10,7 +10,7 @@ experiments.
 """
 
 from functools import partial
-from typing import Callable, Tuple
+from typing import Callable, NamedTuple, Tuple
 
 import flax.linen as nn
 import jax
@@ -24,15 +24,50 @@ from task_wrappers.base import BaseTaskWrapper
 
 
 NUM_OPTIONS = 2
+zero = jnp.float32(0.0)
+one = jnp.float32(1.0)
+
+
+class _EmptyOptState(NamedTuple):
+    """Placeholder Optax state for a stateless transform."""
+
+
+def _scale_updates_by_option_learning_rate(
+    learning_rate: jax.Array,
+) -> optax.GradientTransformation:
+    """Multiply Adam updates by a leading-option learning-rate vector."""
+
+    def init_fn(_params):
+        return _EmptyOptState()
+
+    def update_fn(updates, state, params=None):
+        del params
+        learning_rates = jnp.asarray(learning_rate)
+
+        def scale(update):
+            shape = (NUM_OPTIONS,) + (1,) * (update.ndim - 1)
+            return -learning_rates.reshape(shape) * update
+
+        return jax.tree.map(scale, updates), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _make_policy_optimizer(learning_rate: jax.Array) -> optax.GradientTransformation:
+    """Adam whose learning rate is a ``(2,)`` vector over stacked policies."""
+    return optax.chain(
+        optax.scale_by_adam(),
+        _scale_updates_by_option_learning_rate(learning_rate),
+    )
 
 
 @dataclass
 class BinaryOptionCriticPPOConfigs:
-    policy_learning_rate: float = 3e-4
+    policy_learning_rates: Tuple[float, float] = (3e-4, 3e-4)
     critic_learning_rate: float = 5e-4
     selector_learning_rate: float = 1e-4
     policy_clip_ratio: float = 0.2
-    selector_probability_limit: float = 0.1
+    selector_deviation_limit: float = 0.1
     entropy_gain: float = 0.01
     discount: float = 0.99
     gae_lambda: float = 0.95
@@ -95,13 +130,24 @@ class BinaryOptionCriticPPO:
     ):
         if configs.policy_clip_ratio <= 0:
             raise ValueError("policy_clip_ratio must be positive")
-        if not 0 <= configs.selector_probability_limit <= 1:
-            raise ValueError("selector_probability_limit must be in [0, 1]")
+        if not 0 <= configs.selector_deviation_limit <= 1:
+            raise ValueError("selector_deviation_limit must be in [0, 1]")
         if not 0 <= configs.state_swap_fraction <= 1:
             raise ValueError("state_swap_fraction must be in [0, 1]")
         if not 0 < configs.moving_mse_ema_learning_rate <= 1:
             raise ValueError(
                 "moving_mse_ema_learning_rate must be in (0, 1]"
+            )
+
+        if any(lr <= 0 for lr in configs.policy_learning_rates):
+            raise ValueError("policy_learning_rates must be positive")
+
+        policy_learning_rates = jnp.asarray(
+            configs.policy_learning_rates, dtype=jnp.float32
+        )
+        if policy_learning_rates.shape != (NUM_OPTIONS,):
+            raise ValueError(
+                f"policy_learning_rates must have shape ({NUM_OPTIONS},)"
             )
 
         self._env = env
@@ -111,68 +157,176 @@ class BinaryOptionCriticPPO:
         self._persistence_anneal_fn = persistence_anneal_fn
         self.configs = configs
 
-        self._policy_optimizer = optax.adam(configs.policy_learning_rate)
+        # Learning rates remain injectable so each policy can be adapted later.
+        self._policy_optimizer = optax.inject_hyperparams(
+            _make_policy_optimizer
+        )(learning_rate=policy_learning_rates)
         self._critic_optimizer = optax.adam(configs.critic_learning_rate)
         self._selector_optimizer = optax.adam(configs.selector_learning_rate)
 
 
 
-    def calculate_option_targets_and_gaes(
-        self,
-        rollout: OptionRollout,
-        all_option_values: jax.Array,
-        all_selector_probs: jax.Array,
+    def calculate_option_GAEs(
+        self, 
+        rollout_data: OptionRollout, # (rollout_length, 2, vec_env, ...)
+        all_option_values: jax.Array, # (rollout_length + 1, 2, vec_env, 2)
+        all_selector_probs: jax.Array, # (rollout_length + 1, 2, vec_env, 1)
+        persistence: float,
+        ) -> jax.Array:
+
+        corresponding_probs = jnp.concatenate([
+          all_selector_probs[1:, :1, ...],
+          1 - all_selector_probs[1:, 1:, ...],
+        ], axis=1) # (rollout, 2, vec_env, 1)
+        rearranged_option_values = jnp.concatenate([
+            all_option_values[:, :1, ...],
+            jnp.flip(all_option_values[:, 1:, ...], axis=-1),
+        ], axis=1) # (rollout + 1, 2, vec_env, 2)
+
+        p = persistence + (1 - persistence) * corresponding_probs # (rollout, 2, vec_env, 1)
+        actual_discount = jnp.where(rollout_data.dones > 0.5, zero, self.configs.discount) # if done, discount = 0
+
+        ks = self.configs.gae_lambda * actual_discount * p # (rollout, 2, vec_env, 1)
+        bs = actual_discount * (
+            (1 - self.configs.gae_lambda) * p * rearranged_option_values[1:, ..., :1] + (1 - p) * rearranged_option_values[1:, ..., 1:]
+        ) # (rollout, 2, vec_env, 1)
+
+
+        def scan_calculate_conditioned_gaes(carry, data) -> Tuple[jax.Array, jax.Array]:
+            reward, truncation, k, b, v = data
+            new_carry = jnp.where(truncation > 0.5, v, reward + k * carry + b)
+            gae = new_carry - v
+            return new_carry, gae
+
+        _, gaes = jax.lax.scan(
+            scan_calculate_conditioned_gaes,
+            rearranged_option_values[-1, ..., :1],
+            (rollout_data.rewards, rollout_data.truncations, ks, bs, rearranged_option_values[:-1, ..., :1]),
+            reverse=True,
+            )
+
+        gae_mean = jnp.mean(gaes, axis=(0, 2, 3), keepdims=True) # (1, 2, 1, 1)
+        gae_std = jnp.std(gaes, axis=(0, 2, 3), keepdims=True) # (1, 2, 1, 1)
+        clipped_gaes = jnp.clip(gaes, gae_mean - 3*gae_std, gae_mean + 3*gae_std) # (rollout, 2, vec_env, 1)
+        gaes = clipped_gaes - jnp.minimum(jnp.mean(clipped_gaes, axis=(0, 2, 3), keepdims=True), zero) # (rollout, 2, vec_env, 1)
+
+        return gaes / (jnp.sqrt(jnp.mean(gaes**2, axis=(0, 2, 3), keepdims=True)) + 1e-6) # (rollout, 2, vec_env, 1)
+
+
+    def calculate_option_critic_targets(
+        self, 
+        rollout_data: OptionRollout, # (rollout_length, 2, vec_env, ...)
+        all_option_values: jax.Array, # (rollout_length + 1, 2, vec_env, 2)
+        all_selector_probs: jax.Array, # (rollout_length + 1, 2, vec_env, 1)
         training_state: BinaryOptionCriticPPOTrainingState,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """Placeholder for the option-conditioned target and GAE equations.
+        ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
 
-        ``all_option_values`` has shape ``(T + 1, 2, E, 2)`` and
-        ``all_selector_probs`` has shape ``(T + 1, 2, E, 2)``.  The last
-        axis indexes the candidate critic/option.  Critic values are already
-        denormalized to the raw return scale.
+        corresponding_probs = jnp.concatenate([
+            all_selector_probs[1:, :1, ...],
+            1 - all_selector_probs[1:, 1:, ...],
+        ], axis=1) # (rollout, 2, vec_env, 1)
+        rearranged_option_values = jnp.concatenate([
+            all_option_values[:, :1, ...],
+            jnp.flip(all_option_values[:, 1:, ...], axis=-1),
+        ], axis=1) # (rollout + 1, 2, vec_env, 2)
 
-        TODO: continuation must combine persistence and selector probabilities.
-        TODO: termination and time-limit truncation need separate handling.
-        TODO: GAE must remain option-conditioned and on the raw return scale.
-        """
-        del all_selector_probs  # TODO: used by the real continuation target
+        persistence = self._persistence_anneal_fn(training_state.iteration_num + 1)
+        p = persistence + (1 - persistence) * corresponding_probs # (rollout, 2, vec_env, 1)
+        actual_discount = jnp.where(rollout_data.dones > 0.5, zero, self.configs.discount) # if done, discount = 0
 
-        # Select each rollout policy's matching critic from the candidate axis.
-        option_identity = jnp.eye(NUM_OPTIONS)[None, :, None, :]
-        current_values = jnp.sum(
-            all_option_values[:-1] * option_identity, axis=-1, keepdims=True
-        )  # (T, 2, E, 1), raw return scale
+        ks = self.configs.gae_lambda * actual_discount * p # (rollout, 2, vec_env, 1)
+        bs = actual_discount * (
+            (1 - self.configs.gae_lambda) * p * rearranged_option_values[1:, ..., :1] + (1 - p) * rearranged_option_values[1:, ..., 1:]
+        ) # (rollout, 2, vec_env, 1)
 
-        # DUMMY PLACEHOLDER: replace rewards with option-conditioned targets.
-        raw_targets = rollout.rewards
-        advantages = raw_targets - current_values  # TODO: replace with GAE
+        def scan_calculate_critic_targets(carry, data) -> Tuple[jax.Array, jax.Array]:
+            last_target, last_bootstrap_portion = carry
+            reward, truncation, k, b, v = data
+            new_carry = jnp.where(truncation > 0.5, v, reward + k * last_target + b)
+            bootstrap_portion = jnp.where(truncation > 0.5, one, last_bootstrap_portion * k)
+            return new_carry, (new_carry, bootstrap_portion)
 
-        # Update one MSE per option from the unclipped raw target errors.
-        mse_axes = (0,) + tuple(range(2, advantages.ndim))
-        latest_mses = jnp.mean(jnp.square(advantages), axis=mse_axes)
+        init_target = rearranged_option_values[-1, ..., :1] # (2, vec_env, 1)
+        current_values = rearranged_option_values[:-1, ..., :1]
+        _, (
+            critic_targets, # (rollout, 2, vec_env, 1)
+            bootstrap_portions, # (rollout, 2, vec_env, 1)
+            ) = jax.lax.scan(
+            scan_calculate_critic_targets,
+            (init_target, jnp.ones_like(init_target)),
+            (rollout_data.rewards, rollout_data.truncations, ks, bs, current_values),
+            reverse=True,
+            )
+        critic_target_weights = 1 / (jnp.square(bootstrap_portions) + 1)
+        average_returns = jnp.mean(critic_targets, axis=(0, 2, 3)) # (2,)
+
         ema_learning_rate = self.configs.moving_mse_ema_learning_rate
+        latest_mses = jnp.mean(jnp.square(critic_targets - current_values), axis=(0, 2, 3)) # (2,)
         moving_mses = (
             ema_learning_rate * latest_mses
             + (1.0 - ema_learning_rate) * training_state.moving_mses
         )
 
         # Clip raw target deviations using the newly updated per-option RMSE.
-        stat_shape = (1, NUM_OPTIONS) + (1,) * (raw_targets.ndim - 2)
-        rms_errors = jnp.sqrt(jnp.maximum(moving_mses, 0.0)).reshape(stat_shape)
+        rms_errors = jnp.sqrt(jnp.maximum(moving_mses, zero))[None, :, None, None]
         clipped_targets = jnp.clip(
-            raw_targets,
+            critic_targets,
             current_values - 3.0 * rms_errors,
             current_values + 3.0 * rms_errors,
         )
-
-        # Normalize only critic targets; policy advantages remain in raw scale.
-        critic_means = training_state.critic_means.reshape(stat_shape)
-        critic_stds = training_state.critic_stds.reshape(stat_shape)
+        critic_means = training_state.critic_means[None, :, None, None]
+        critic_stds = training_state.critic_stds[None, :, None, None]
         normalized_targets = (
             clipped_targets - critic_means
         ) / (critic_stds + 1e-6)
 
-        return normalized_targets, advantages, moving_mses
+        return (
+            normalized_targets, # (rollout, 2, vec_env, 1)
+            critic_target_weights, # (rollout, 2, vec_env, 1)
+            average_returns, # (2,)
+            moving_mses, # (2,)
+            )
+
+
+    def calculate_selector_target(
+        self, 
+        option_values: jax.Array, # (rollout_length, 2, vec_env, 2)
+        anchor_probs: jax.Array, # (rollout_length, 2, vec_env, 1)
+        ) -> Tuple[jax.Array, jax.Array, float, float, float]:
+
+        value_diffs = jnp.expand_dims(option_values[..., 0] - option_values[..., 1], axis=-1) # (rollout_length, 2, vec_env, 1)
+        selector_targets = jnp.clip(
+            jnp.where(
+                value_diffs > 0,
+                anchor_probs + self.configs.selector_deviation_limit,
+                anchor_probs - self.configs.selector_deviation_limit,
+                ),
+            min=1e-6,
+            max=1.0 - 1e-6,
+            ) # (rollout_length, 2, vec_env, 1)
+        selector_target_weights = jnp.abs(value_diffs)
+        selector_target_weights = selector_target_weights / (jnp.mean(selector_target_weights) + 1e-6)
+
+        # for monitoring
+        selector_advantages = value_diffs * (anchor_probs - 0.5)
+        selector_advantage = jnp.mean(selector_advantages)
+        selector_value = jnp.mean(option_values) + selector_advantage
+        selector_SNR = selector_advantage / (jnp.mean(jnp.abs(selector_advantages)) + 1e-6)
+
+        return selector_targets, selector_target_weights, selector_value, selector_advantage, selector_SNR
+
+
+    def calculate_first_round_selector_target(
+        self, 
+        option_values: jax.Array, # (rollout_length, 2, vec_env, 2)
+        anchor_probs: jax.Array, # (rollout_length, 2, vec_env, 1)
+        ) -> Tuple[jax.Array, jax.Array, float, float, float]:
+
+        selector_target_weights = jnp.ones_like(anchor_probs) # (rollout_length, 2, vec_env, 1)
+        selector_targets = jnp.ones_like(anchor_probs) * 0.5 # (rollout_length, 2, vec_env, 1)
+        selector_value = jnp.mean(option_values)
+
+        return selector_targets, selector_target_weights, selector_value, zero, zero
 
 
     def init(
@@ -321,7 +475,8 @@ class BinaryOptionCriticPPO:
         zs: jax.Array,
     ) -> jax.Array:
         logits = self._selector_network.apply(selector_params, obs, zs)
-        return nn.sigmoid(logits)
+        return nn.sigmoid(logits) # value corresponds to policy 0
+    
 
     def _update_critics(
         self,
@@ -455,10 +610,10 @@ class BinaryOptionCriticPPO:
         )
         anchor = jax.lax.stop_gradient(anchor_probs[..., 1])
         lower = jnp.clip(
-            anchor - self.configs.selector_probability_limit, 1e-6, 1.0 - 1e-6
+            anchor - self.configs.selector_deviation_limit, 1e-6, 1.0 - 1e-6
         )
         upper = jnp.clip(
-            anchor + self.configs.selector_probability_limit, 1e-6, 1.0 - 1e-6
+            anchor + self.configs.selector_deviation_limit, 1e-6, 1.0 - 1e-6
         )
 
         def loss_fn(params):
@@ -545,85 +700,110 @@ class BinaryOptionCriticPPO:
             rollout_key, NUM_OPTIONS * self.configs.vec_env
         ).reshape((NUM_OPTIONS, self.configs.vec_env, -1))
 
-        final_states, rollout = self.rollout(
+        final_states, rollout_data = self.rollout(
             starting_states,
             training_state.policy_params,
             rollout_keys,
         )
         final_obs, final_zs = self._env.get_obs(final_states)
 
-        all_obs = jnp.concatenate((rollout.obs, final_obs[None, ...]), axis=0)
-        all_zs = jnp.concatenate((rollout.zs, final_zs[None, ...]), axis=0)
+        all_obs = jnp.concatenate((rollout_data.obs, final_obs[None, ...]), axis=0)
+        all_zs = jnp.concatenate((rollout_data.zs, final_zs[None, ...]), axis=0)
         all_option_values = self._eval_critics(
             training_state, all_obs, all_zs
-        )
+        ) # (rollout + 1, 2, vec_env, 2)
         all_selector_probs = self._selector_probs(
             training_state.selector_params, all_obs, all_zs
-        )
-        anchor_probs = all_selector_probs[:-1]
+        ) # (rollout + 1, 2, vec_env, 1)
+
+        persistence = self._persistence_anneal_fn(training_state.iteration_num)
+        gaes = self.calculate_option_GAEs(rollout_data, all_option_values, all_selector_probs, persistence) # (rollout, 2, vec_env, 1)
 
         (
-            normalized_targets,
-            advantages,
-            new_moving_mses,
-        ) = self.calculate_option_targets_and_gaes(
-            rollout,
+            selector_targets, # (rollout, 2, vec_env, 1)
+            selector_target_weights, # (rollout, 2, vec_env, 1)
+            selector_value, # float
+            selector_advantage, # float
+            selector_SNR, # float
+            ) = jax.lax.cond(
+            training_state.iteration_num > 0,
+            self.calculate_selector_target,
+            self.calculate_first_round_selector_target,
+            all_option_values[:-1], 
+            all_selector_probs[:-1],
+        )
+
+        # ==============================================
+        #                TO DO
+        # ==============================================
+        # shuffle the data and update the policies and selectors
+
+
+
+        # ==============================================
+        #                TO DO
+        # ==============================================
+        # compute the critic target with the new selector
+        # shuffle the data and update the critics
+        (
+            normalized_critic_targets, # (rollout, 2, vec_env, 1)
+            critic_target_weights, # (rollout, 2, vec_env, 1)
+            average_returns, # (2,)
+            new_moving_mses, # (2,)
+        ) = self.calculate_option_critic_targets(
+            rollout_data,
+            all_selector_probs, # <--- This needs to be computed with the updated selector
             all_option_values,
-            all_selector_probs,
             training_state,
         )
 
-        critic_params, critic_opt_state, critic_losses = (
-            self._update_critics(training_state, rollout, normalized_targets)
-        )
-        (
-            policy_params,
-            policy_opt_state,
-            policy_losses,
-            policy_kls,
-        ) = self._update_policies(training_state, rollout, advantages)
 
-        updated_critic_state = training_state.replace(
-            critic_params=critic_params
-        )
-        updated_option_values = self._eval_critics(
-            updated_critic_state, rollout.obs, rollout.zs
-        )
-        (
-            selector_params,
-            selector_opt_state,
-            selector_loss,
-            selector_max_deviation,
-            selector_boundary_fraction,
-        ) = self._update_selector(
-            training_state.selector_params,
-            training_state.selector_opt_state,
-            rollout,
-            updated_option_values,
-            anchor_probs,
-        )
+
+
+        # ==============================================
+        #                TO DO
+        # ==============================================
+        # Anneal the learning rates based on the policy stds
+        # policy_opt_state = policy_opt_state._replace(
+        #     hyperparams={
+        #         **policy_opt_state.hyperparams,
+        #         "learning_rate": new_lrs,  # shape (2,)
+        #     }
+        # )
 
         new_training_state = training_state.replace(
-            policy_params=policy_params,
-            critic_params=critic_params,
-            selector_params=selector_params,
-            policy_opt_state=policy_opt_state,
-            critic_opt_state=critic_opt_state,
-            selector_opt_state=selector_opt_state,
+            policy_params=policy_params, # TO DO
+            critic_params=critic_params, # TO DO
+            selector_params=selector_params, # TO DO
+            policy_opt_state=policy_opt_state, # TO DO
+            critic_opt_state=critic_opt_state, # TO DO
+            selector_opt_state=selector_opt_state, # TO DO
             iteration_num=training_state.iteration_num + 1,
             moving_mses=new_moving_mses,
         )
         final_states = self._swap_option_states(final_states, swap_key)
 
-        reward_axes = (0,) + tuple(range(2, rollout.rewards.ndim))
+
+        # ==============================================
+        #                TO DO
+        # ==============================================
+        # Things to monitor
+        # 1) policy approx kl, shape of (2,) 
+        # 2) option returns (from critic targets), shape of (2,) 
+        # 3) critic rmse errors during training, shape of (2,) 
+        # 4) average selector preference, float 
+        # 5) selector_value, float
+        # 6) selector advantage, float
+        # 7) selector SNR, float
+
         metrics = BinaryOptionCriticPPOMetrics(
-            reward_per_option=jnp.mean(rollout.rewards, axis=reward_axes),
+            reward_per_option=jnp.mean(rollout_data.rewards, axis=reward_axes),
             policy_loss_per_option=policy_losses,
             critic_loss_per_option=critic_losses,
             policy_kl_per_option=policy_kls,
             selector_loss=selector_loss,
             selector_max_deviation=selector_max_deviation,
             selector_boundary_fraction=selector_boundary_fraction,
-            persistence=self._persistence_anneal_fn(training_state.iteration_num),
+            persistence=persistence,
         )
         return (final_states, new_training_state, key), metrics
