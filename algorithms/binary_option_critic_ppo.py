@@ -63,19 +63,20 @@ def _make_policy_optimizer(learning_rate: jax.Array) -> optax.GradientTransforma
 
 @dataclass
 class BinaryOptionCriticPPOConfigs:
-    policy_learning_rates: Tuple[float, float] = (3e-4, 3e-4)
+    policy_learning_rates_per_std: Tuple[float, float] = (1e-3, 1e-3)
     critic_learning_rate: float = 5e-4
-    selector_learning_rate: float = 1e-4
+    selector_learning_rate: float = 3e-4
     policy_clip_ratio: float = 0.2
     selector_deviation_limit: float = 0.1
-    entropy_gain: float = 0.01
+    entropy_gain: float = 0.001
     discount: float = 0.99
     gae_lambda: float = 0.95
     rollout_length: int = 32
     vec_env: int = 2048
+    mini_batch_size: int = 1024
     policy_epochs: int = 4
     critic_epochs: int = 4
-    selector_epochs: int = 4
+    selector_epochs: int = 2
     moving_mse_ema_learning_rate: float = 0.05
     state_swap_fraction: float = 0.25
 
@@ -92,6 +93,25 @@ class OptionRollout(PyTreeNode):
     truncations: jax.Array
 
 
+class PolicyTrainingData(PyTreeNode):
+    """Policy data with arbitrary leading batch dimensions."""
+
+    obs: jax.Array
+    zs: jax.Array
+    actions: jax.Array
+    log_likelihood: jax.Array
+    gaes: jax.Array
+
+
+class WeightedRegressionData(PyTreeNode):
+    """Shared data layout for selector and critic regression."""
+
+    obs: jax.Array
+    zs: jax.Array
+    target_values: jax.Array
+    weights: jax.Array
+
+
 class BinaryOptionCriticPPOTrainingState(PyTreeNode):
     policy_params: Params
     critic_params: Params
@@ -106,14 +126,13 @@ class BinaryOptionCriticPPOTrainingState(PyTreeNode):
 
 
 class BinaryOptionCriticPPOMetrics(PyTreeNode):
-    reward_per_option: jax.Array
-    policy_loss_per_option: jax.Array
-    critic_loss_per_option: jax.Array
-    policy_kl_per_option: jax.Array
-    selector_loss: jax.Array
-    selector_max_deviation: jax.Array
-    selector_boundary_fraction: jax.Array
-    persistence: jax.Array
+    policy_approx_kls: jax.Array  # (2,)
+    option_returns: jax.Array  # (2,)
+    critic_rmses: jax.Array  # (2,)
+    average_selector_preference: jax.Array  # scalar
+    selector_value: jax.Array  # scalar
+    selector_advantage: jax.Array  # scalar
+    selector_SNR: jax.Array  # scalar
 
 
 class BinaryOptionCriticPPO:
@@ -138,12 +157,19 @@ class BinaryOptionCriticPPO:
             raise ValueError(
                 "moving_mse_ema_learning_rate must be in (0, 1]"
             )
+        samples_per_option = configs.rollout_length * configs.vec_env
+        if configs.mini_batch_size <= 0:
+            raise ValueError("mini_batch_size must be positive")
+        if samples_per_option % configs.mini_batch_size != 0:
+            raise ValueError(
+                "rollout_length * vec_env must be divisible by mini_batch_size"
+            )
 
-        if any(lr <= 0 for lr in configs.policy_learning_rates):
+        if any(lr <= 0 for lr in configs.policy_learning_rates_per_std):
             raise ValueError("policy_learning_rates must be positive")
 
         policy_learning_rates = jnp.asarray(
-            configs.policy_learning_rates, dtype=jnp.float32
+            configs.policy_learning_rates_per_std, dtype=jnp.float32
         )
         if policy_learning_rates.shape != (NUM_OPTIONS,):
             raise ValueError(
@@ -156,6 +182,9 @@ class BinaryOptionCriticPPO:
         self._selector_network = selector_network
         self._persistence_anneal_fn = persistence_anneal_fn
         self.configs = configs
+        self.samples_per_option = samples_per_option
+        self.mini_batch_num = samples_per_option // configs.mini_batch_size
+        self._clip_log_ratio = jnp.log(1.0 + configs.policy_clip_ratio)
 
         # Learning rates remain injectable so each policy can be adapted later.
         self._policy_optimizer = optax.inject_hyperparams(
@@ -369,13 +398,26 @@ class BinaryOptionCriticPPO:
             key, obs=fake_obs, z=fake_z
         )
 
+        policy_opt_state = self._policy_optimizer.init(policy_params)
+        std_logits = policy_params["params"]["std_logits"] # (2, action_dim)
+        rms_std = jnp.sqrt(jnp.mean(nn.sigmoid(std_logits)**2, axis=-1)) # (2,)
+        adjusted_learning_rates = jnp.clip(
+            rms_std * self.configs.policy_learning_rates_per_std,
+            max=3e-4,
+        ) # (2,)
+        policy_opt_state = policy_opt_state._replace(
+            hyperparams={
+                **policy_opt_state.hyperparams,
+                "learning_rate": adjusted_learning_rates,
+            }
+        )
 
         iteration_num = jnp.asarray(0, dtype=jnp.int32)
         return BinaryOptionCriticPPOTrainingState(
             policy_params=policy_params,
             critic_params=critic_params,
             selector_params=selector_params,
-            policy_opt_state=self._policy_optimizer.init(policy_params),
+            policy_opt_state=policy_opt_state,
             critic_opt_state=self._critic_optimizer.init(critic_params),
             selector_opt_state=self._selector_optimizer.init(selector_params),
             critic_means=critic_means,
@@ -476,190 +518,232 @@ class BinaryOptionCriticPPO:
     ) -> jax.Array:
         logits = self._selector_network.apply(selector_params, obs, zs)
         return nn.sigmoid(logits) # value corresponds to policy 0
+
+    def _make_split_shuffle_indices(self, key: RNGKey) -> jax.Array:
+        """Return two independent permutations shaped ``(2, M, B)``."""
+        option_keys = jax.random.split(key, NUM_OPTIONS)
+        return jax.vmap(
+            lambda option_key: jax.random.permutation(
+                option_key, self.samples_per_option
+            ).reshape(
+                self.mini_batch_num,
+                self.configs.mini_batch_size,
+            )
+        )(option_keys)
+
+    def _split_shuffle_option_data(
+        self,
+        data: PyTreeNode,
+        shuffled_indices: jax.Array,
+    ) -> PyTreeNode:
+        """Shuffle each option independently into ``(M, 2, B, ...)``."""
+
+        def shuffle_leaf(value):
+            # (T, 2, E, ...) -> (2, T * E, ...)
+            option_major = jnp.swapaxes(value, 1, 0) # (2, T, E, ...)
+            flattened = option_major.reshape(
+                NUM_OPTIONS,
+                self.samples_per_option,
+                -1,
+            ) # (2, T * E, ...)
+
+            # Each option uses its own permutation in shuffled_indices.
+            shuffled = jax.vmap(
+                lambda option_data, option_indices: option_data[option_indices]
+            )(flattened, shuffled_indices)  # (2, M, B, ...)
+            return jnp.swapaxes(shuffled, 0, 1)  # (M, 2, B, ...)
+
+        return jax.tree.map(shuffle_leaf, data)
     
 
     def _update_critics(
         self,
-        training_state: BinaryOptionCriticPPOTrainingState,
-        rollout: OptionRollout,
-        targets: jax.Array,
+        critic_params: Params,
+        critic_opt_state: optax.OptState,
+        critic_training_data: WeightedRegressionData,
     ) -> Tuple[Params, optax.OptState, jax.Array]:
-        option_obs = jnp.swapaxes(rollout.obs, 0, 1)
-        option_zs = jnp.swapaxes(rollout.zs, 0, 1)
-        option_targets = jnp.swapaxes(targets, 0, 1)
+        """Update both option critics with weighted MSE minibatches.
 
-        def loss_fn(critic_params):
-            def option_loss(params, obs, zs, target):
-                prediction = self._critic_network.apply(params, obs, zs)
-                return jnp.mean(jnp.square(prediction - target))
+        ``critic_training_data`` has leading shape
+        ``(mini_batch_num, 2, mini_batch_size, ...)``.
+        """
+
+        def loss_fn(params, training_data):
+            # training_data fields: (2, mini_batch_size, feature_dim)
+
+            def option_loss(option_params, obs, zs, target, weight):
+                prediction = self._critic_network.apply(
+                    option_params, obs, zs
+                ) # (mini_batch_size, 1)
+                squared_error = jnp.square(prediction - target) # (mini_batch_size, 1)
+                return jnp.average(squared_error, weights=weight) # scalar
 
             losses = jax.vmap(option_loss)(
-                critic_params, option_obs, option_zs, option_targets
-            )
-            return jnp.sum(losses), losses
+                params,
+                training_data.obs,
+                training_data.zs,
+                training_data.target_values,
+                training_data.weights,
+            ) # (2,)
+            return jnp.sum(losses), jnp.sqrt(losses) # scalar, (2,)
 
-        def update_step(carry, _):
+        def update_minibatch(carry, training_data):
             params, opt_state = carry
-            (_, losses), gradients = jax.value_and_grad(
-                loss_fn, has_aux=True
-            )(params)
+            gradients, losses = jax.grad(loss_fn, has_aux=True)(
+                params, training_data
+            ) # losses: (2,)
             updates, opt_state = self._critic_optimizer.update(
                 gradients, opt_state, params
             )
             params = optax.apply_updates(params, updates)
-            return (params, opt_state), losses
+            return (params, opt_state), losses # (2,)
 
-        (critic_params, critic_opt_state), losses = jax.lax.scan(
-            update_step,
-            (training_state.critic_params, training_state.critic_opt_state),
+        def update_epoch(carry, _):
+            return jax.lax.scan(
+                update_minibatch,
+                carry,
+                critic_training_data,
+            ) # losses: (mini_batch_num, 2)
+
+        (critic_params, critic_opt_state), critic_losses = jax.lax.scan(
+            update_epoch,
+            (critic_params, critic_opt_state),
             length=self.configs.critic_epochs,
+        ) # critic_losses: (critic_epochs, mini_batch_num, 2)
+        return (
+            critic_params,
+            critic_opt_state,
+            jnp.mean(critic_losses, axis=(0, 1)), # (2,)
         )
-        return critic_params, critic_opt_state, losses[-1]
 
     def _update_policies(
         self,
-        training_state: BinaryOptionCriticPPOTrainingState,
-        rollout: OptionRollout,
-        advantages: jax.Array,
-    ) -> Tuple[Params, optax.OptState, jax.Array, jax.Array]:
-        option_rollout = jax.tree.map(
-            lambda value: jnp.swapaxes(value, 0, 1), rollout
-        )
-        option_advantages = jnp.swapaxes(advantages, 0, 1)
+        policy_params: Params,
+        policy_opt_state: optax.OptState,
+        policy_training_data: PolicyTrainingData,
+    ) -> Tuple[Params, optax.OptState, jax.Array]:
+        """Update both policies with learnable-std PPO minibatches.
 
-        def loss_fn(policy_params):
-            def option_loss(params, data, advantage):
+        ``policy_training_data`` has leading shape
+        ``(mini_batch_num, 2, mini_batch_size, ...)``.
+        """
+
+        def loss_fn(params, training_data):
+            # training_data fields: (2, mini_batch_size, feature_dim)
+
+            def option_loss(option_params, obs, zs, actions, old_log_likelihood, gaes):
                 action_mean, std_logits = self._policy_network.apply(
-                    params, data.obs, data.zs
-                )
-                action_std = nn.sigmoid(std_logits)
-                new_log_prob = -jnp.sum(
-                    jnp.log(action_std + 1e-8)
-                    + 0.5
-                    * jnp.square(data.actions - action_mean)
-                    / (jnp.square(action_std) + 1e-8),
-                    axis=-1,
-                    keepdims=True,
-                )
-                log_ratio = new_log_prob - data.old_log_probs
-                ratio = jnp.exp(log_ratio)
-                clipped_ratio = jnp.clip(
-                    ratio,
-                    1.0 - self.configs.policy_clip_ratio,
-                    1.0 + self.configs.policy_clip_ratio,
-                )
-                surrogate = jnp.minimum(
-                    ratio * advantage, clipped_ratio * advantage
+                    option_params, obs, zs
                 )
                 entropy = jnp.sum(
-                    jnp.log(action_std + 1e-8), axis=-1
-                )
-                loss = -jnp.mean(surrogate) - (
-                    self.configs.entropy_gain * jnp.mean(entropy)
+                    nn.log_sigmoid(std_logits), axis=-1, keepdims=True
+                ) # (1,)
+                new_log_likelihood = (
+                    -0.5 * jnp.sum(
+                        jnp.square(jnp.exp(-std_logits) + 1) * (jnp.square(action_mean - actions) + 1e-6),
+                        axis=-1,
+                        keepdims=True,
+                    ) - entropy
+                ) # (mini_batch_size, 1)
+                log_ratio = new_log_likelihood - old_log_likelihood
+                ratio = jnp.exp(log_ratio)
+                loss_cond = jax.lax.stop_gradient(
+                    log_ratio * jnp.sign(gaes)
+                    <= self._clip_log_ratio
                 )
                 approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
+                loss = jnp.mean(
+                    jnp.where(loss_cond, -gaes * ratio, 0.0)
+                    - self.configs.entropy_gain * entropy
+                )
                 return loss, approx_kl
 
-            losses, approximate_kls = jax.vmap(
-                option_loss, in_axes=(0, 0, 0)
-            )(
-                policy_params,
-                option_rollout,
-                option_advantages,
-            )
-            return jnp.sum(losses), (losses, approximate_kls)
+            losses, approx_kls = jax.vmap(option_loss)(
+                params,
+                training_data.obs,
+                training_data.zs,
+                training_data.actions,
+                training_data.log_likelihood,
+                training_data.gaes,
+            ) # (2,), (2,)
+            return jnp.sum(losses), approx_kls
 
-        def update_step(carry, _):
+        def update_minibatch(carry, training_data):
             params, opt_state = carry
-            (_, metrics), gradients = jax.value_and_grad(
-                loss_fn, has_aux=True
-            )(params)
+            gradients, approx_kls = jax.grad(loss_fn, has_aux=True)(
+                params, training_data
+            ) # approx_kls: (2,)
             updates, opt_state = self._policy_optimizer.update(
                 gradients, opt_state, params
             )
             params = optax.apply_updates(params, updates)
-            return (params, opt_state), metrics
+            return (params, opt_state), approx_kls # (2,)
 
-        (policy_params, policy_opt_state), (losses, approximate_kls) = (
-            jax.lax.scan(
-                update_step,
-                (training_state.policy_params, training_state.policy_opt_state),
-                length=self.configs.policy_epochs,
-            )
-        )
+        def update_epoch(carry, _):
+            return jax.lax.scan(
+                update_minibatch,
+                carry,
+                policy_training_data,
+            ) # approx_kls: (mini_batch_num, 2)
+
+        (policy_params, policy_opt_state), approx_kls = jax.lax.scan(
+            update_epoch,
+            (policy_params, policy_opt_state),
+            length=self.configs.policy_epochs,
+        ) # approx_kls: (policy_epochs, mini_batch_num, 2)
         return (
             policy_params,
             policy_opt_state,
-            losses[-1],
-            approximate_kls[-1],
+            jnp.mean(approx_kls, axis=(0, 1)), # (2,)
         )
 
-    def _update_selector( # <--- TO DO
+    def _update_selector(
         self,
         selector_params: Params,
         selector_opt_state: optax.OptState,
-        rollout: OptionRollout,
-        updated_option_values: jax.Array,
-        anchor_probs: jax.Array,
-    ) -> Tuple[Params, optax.OptState, jax.Array, jax.Array, jax.Array]:
-        preferred_option_one = jax.lax.stop_gradient(
-            (
-                updated_option_values[..., 1]
-                > updated_option_values[..., 0]
-            ).astype(jnp.float32)
-        )
-        anchor = jax.lax.stop_gradient(anchor_probs[..., 1])
-        lower = jnp.clip(
-            anchor - self.configs.selector_deviation_limit, 1e-6, 1.0 - 1e-6
-        )
-        upper = jnp.clip(
-            anchor + self.configs.selector_deviation_limit, 1e-6, 1.0 - 1e-6
-        )
+        selector_training_data: WeightedRegressionData,
+    ) -> Tuple[Params, optax.OptState]:
+        """Update the scalar sigmoid selector with weighted BCE minibatches.
 
-        def loss_fn(params):
+        ``selector_training_data`` has leading shape
+        ``(mini_batch_num, 2, mini_batch_size, ...)``.
+        """
+
+        def loss_fn(params, training_data):
             logits = self._selector_network.apply(
-                params, rollout.obs, rollout.zs
-            )
-            option_one_logit = logits[..., 1] - logits[..., 0]
-            probability = nn.sigmoid(option_one_logit)
-            below = probability < lower
-            above = probability > upper
-            outside = below | above
-            bounded_target = jnp.where(below, lower, upper)
-            target = jnp.where(
-                outside, bounded_target, preferred_option_one
-            )
-            loss = jnp.mean(
-                optax.sigmoid_binary_cross_entropy(option_one_logit, target)
-            )
-            return loss, (
-                jnp.max(jnp.abs(probability - anchor)),
-                jnp.mean(outside),
-            )
+                params, training_data.obs, training_data.zs
+            ) # (2, mini_batch_size, 1)
+            losses = optax.sigmoid_binary_cross_entropy(
+                logits,
+                training_data.target_values, # (2, mini_batch_size, 1)
+            ) # (2, mini_batch_size, 1)
+            weighted_losses = (
+                training_data.weights * losses
+            ) # (2, mini_batch_size, 1)
+            return jnp.mean(weighted_losses) # scalar
 
-        def update_step(carry, _):
+        def update_minibatch(carry, training_data):
             params, opt_state = carry
-            (loss, metrics), gradients = jax.value_and_grad(
-                loss_fn, has_aux=True
-            )(params)
+            gradients = jax.grad(loss_fn)(params, training_data)
             updates, opt_state = self._selector_optimizer.update(
                 gradients, opt_state, params
             )
             params = optax.apply_updates(params, updates)
-            return (params, opt_state), (loss, *metrics)
+            return (params, opt_state), None
 
-        (selector_params, selector_opt_state), selector_metrics = jax.lax.scan(
-            update_step,
+        def update_epoch(carry, _):
+            return jax.lax.scan(
+                update_minibatch,
+                carry,
+                selector_training_data,
+            )
+
+        (selector_params, selector_opt_state), _ = jax.lax.scan(
+            update_epoch,
             (selector_params, selector_opt_state),
             length=self.configs.selector_epochs,
         )
-        return (
-            selector_params,
-            selector_opt_state,
-            selector_metrics[0][-1],
-            selector_metrics[1][-1],
-            selector_metrics[2][-1],
-        )
+        return selector_params, selector_opt_state
 
     def _swap_option_states(
         self,
@@ -695,7 +779,7 @@ class BinaryOptionCriticPPO:
     ]:
         """Run one structurally complete, mathematically incomplete iteration."""
 
-        key, rollout_key, swap_key = jax.random.split(key, 3)
+        key, rollout_key, shuffle_key, swap_key = jax.random.split(key, 4)
         rollout_keys = jax.random.split(
             rollout_key, NUM_OPTIONS * self.configs.vec_env
         ).reshape((NUM_OPTIONS, self.configs.vec_env, -1))
@@ -722,9 +806,9 @@ class BinaryOptionCriticPPO:
         (
             selector_targets, # (rollout, 2, vec_env, 1)
             selector_target_weights, # (rollout, 2, vec_env, 1)
-            selector_value, # float
-            selector_advantage, # float
-            selector_SNR, # float
+            selector_value, # scalar
+            selector_advantage, # scalar
+            selector_SNR, # scalar
             ) = jax.lax.cond(
             training_state.iteration_num > 0,
             self.calculate_selector_target,
@@ -732,19 +816,57 @@ class BinaryOptionCriticPPO:
             all_option_values[:-1], 
             all_selector_probs[:-1],
         )
+        average_selector_preference = jnp.mean(all_selector_probs[:-1]) # scalar
 
-        # ==============================================
-        #                TO DO
-        # ==============================================
-        # shuffle the data and update the policies and selectors
+        # Independently shuffle data generated by each rollout policy.
+        shuffled_indices = self._make_split_shuffle_indices(shuffle_key) # (2, mini_batch_num, mini_batch_size)
 
+        policy_training_data = PolicyTrainingData(
+            obs=rollout_data.obs,
+            zs=rollout_data.zs,
+            actions=rollout_data.actions,
+            log_likelihood=rollout_data.old_log_probs,
+            gaes=gaes,
+        )
+        policy_training_data = self._split_shuffle_option_data(
+            policy_training_data,
+            shuffled_indices,
+        )  # (mini_batch_num, 2, mini_batch_size, ...)
 
+        (
+            shuffled_selector_targets,
+            shuffled_selector_target_weights,
+            ) = self._split_shuffle_option_data(
+            (selector_targets, selector_target_weights),
+            shuffled_indices,
+        )
+        selector_training_data = WeightedRegressionData(
+            obs=policy_training_data.obs,
+            zs=policy_training_data.zs,
+            target_values=shuffled_selector_targets,
+            weights=shuffled_selector_target_weights,
+        )
 
-        # ==============================================
-        #                TO DO
-        # ==============================================
-        # compute the critic target with the new selector
-        # shuffle the data and update the critics
+        selector_params, selector_opt_state = self._update_selector(
+            training_state.selector_params,
+            training_state.selector_opt_state,
+            selector_training_data,
+        )
+
+        (
+            policy_params,
+            policy_opt_state,
+            policy_kls,
+        ) = self._update_policies(
+            training_state.policy_params,
+            training_state.policy_opt_state,
+            policy_training_data,
+        )
+
+        # Critic targets use the updated selector, then reuse the same split indices.
+        all_selector_probs = self._selector_probs(
+            selector_params, all_obs, all_zs
+        ) # (rollout + 1, 2, vec_env, 1)
         (
             normalized_critic_targets, # (rollout, 2, vec_env, 1)
             critic_target_weights, # (rollout, 2, vec_env, 1)
@@ -752,58 +874,66 @@ class BinaryOptionCriticPPO:
             new_moving_mses, # (2,)
         ) = self.calculate_option_critic_targets(
             rollout_data,
-            all_selector_probs, # <--- This needs to be computed with the updated selector
             all_option_values,
+            all_selector_probs,
             training_state,
         )
+        (
+            shuffled_critic_targets,
+            shuffled_critic_target_weights,
+        ) = self._split_shuffle_option_data(
+            (normalized_critic_targets, critic_target_weights),
+            shuffled_indices,
+        )
+        critic_training_data = WeightedRegressionData(
+            obs=policy_training_data.obs,
+            zs=policy_training_data.zs,
+            target_values=shuffled_critic_targets,
+            weights=shuffled_critic_target_weights,
+        )
+        (
+            critic_params,
+            critic_opt_state,
+            critic_losses,
+        ) = self._update_critics(
+            training_state.critic_params,
+            training_state.critic_opt_state,
+            critic_training_data,
+        )
 
-
-
-
-        # ==============================================
-        #                TO DO
-        # ==============================================
-        # Anneal the learning rates based on the policy stds
-        # policy_opt_state = policy_opt_state._replace(
-        #     hyperparams={
-        #         **policy_opt_state.hyperparams,
-        #         "learning_rate": new_lrs,  # shape (2,)
-        #     }
-        # )
+        # learning rate annealing
+        std_logits = policy_params["params"]["std_logits"] # (2, action_dim)
+        rms_std = jnp.sqrt(jnp.mean(nn.sigmoid(std_logits)**2, axis=-1)) # (2,)
+        adjusted_learning_rates = jnp.clip(
+            rms_std * self.configs.policy_learning_rates_per_std, 
+            max=3e-4,
+            ) # (2,)
+        policy_opt_state = policy_opt_state._replace(
+            hyperparams={
+                **policy_opt_state.hyperparams,
+                "learning_rate": adjusted_learning_rates,  # shape (2,)
+            }
+        )
 
         new_training_state = training_state.replace(
-            policy_params=policy_params, # TO DO
-            critic_params=critic_params, # TO DO
-            selector_params=selector_params, # TO DO
-            policy_opt_state=policy_opt_state, # TO DO
-            critic_opt_state=critic_opt_state, # TO DO
-            selector_opt_state=selector_opt_state, # TO DO
+            policy_params=policy_params,
+            critic_params=critic_params,
+            selector_params=selector_params,
+            policy_opt_state=policy_opt_state,
+            critic_opt_state=critic_opt_state,
+            selector_opt_state=selector_opt_state,
             iteration_num=training_state.iteration_num + 1,
             moving_mses=new_moving_mses,
         )
         final_states = self._swap_option_states(final_states, swap_key)
 
-
-        # ==============================================
-        #                TO DO
-        # ==============================================
-        # Things to monitor
-        # 1) policy approx kl, shape of (2,) 
-        # 2) option returns (from critic targets), shape of (2,) 
-        # 3) critic rmse errors during training, shape of (2,) 
-        # 4) average selector preference, float 
-        # 5) selector_value, float
-        # 6) selector advantage, float
-        # 7) selector SNR, float
-
         metrics = BinaryOptionCriticPPOMetrics(
-            reward_per_option=jnp.mean(rollout_data.rewards, axis=reward_axes),
-            policy_loss_per_option=policy_losses,
-            critic_loss_per_option=critic_losses,
-            policy_kl_per_option=policy_kls,
-            selector_loss=selector_loss,
-            selector_max_deviation=selector_max_deviation,
-            selector_boundary_fraction=selector_boundary_fraction,
-            persistence=persistence,
+            policy_approx_kls=policy_kls, # (2,)
+            option_returns=average_returns, # (2,)
+            critic_rmses=critic_losses, # (2,)
+            average_selector_preference=average_selector_preference, # scalar
+            selector_value=selector_value, # scalar
+            selector_advantage=selector_advantage, # scalar
+            selector_SNR=selector_SNR, # scalar
         )
         return (final_states, new_training_state, key), metrics
