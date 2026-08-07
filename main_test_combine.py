@@ -71,7 +71,7 @@ policy_network = GC_PPO_Policy(
     initial_std=0.1 * jnp.ones(env.action_size),
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
-    activation=nn.softplus,
+    activation=nn.silu,
     final_activation=jnp.tanh,
     learnable_std=True,
 )
@@ -79,7 +79,7 @@ policy_network = GC_PPO_Policy(
 critic_network = GCMLP(
     layer_sizes=critic_hidden_layers + (1,),
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
-    activation=nn.softplus,
+    activation=nn.silu,
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
 )
 
@@ -87,7 +87,7 @@ seed = 4455
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 
-folder_path = "output/MORL/test2"
+folder_path = "output/MORL/test3"
 # folder_path = "output/MORL/test"
 
 with open(folder_path + "/policy.msgpack", "rb") as f:
@@ -121,19 +121,6 @@ else:
     component_means = jnp.zeros(env.action_size)
 
 student_hidden_layers = (256, 256)
-# student_action_network = GC_combined_multi_Policy(
-#     shared_hidden_layer_sizes=(256,),
-#     split_hidden_layer_sizes=(128,),
-#     action_dim=env.action_size,
-#     component_num=component_num,
-#     k1=k1,
-#     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
-#     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
-#     activation=nn.silu,
-#     final_activation=jnp.tanh,
-#     learnable_std=True,
-#     component_means=component_means,
-# )
 student_action_network = GC_multi_Policy(
     hidden_layer_sizes=(256, 256),
     action_dim=env.action_size,
@@ -157,7 +144,7 @@ student_action_network = GC_multi_Policy(
 #     activation=nn.silu,
 # )
 student_selection_network = GC_Selector(
-    hidden_layer_sizes=(256, 256),
+    hidden_layer_sizes=(128, 128),
     component_num=component_num,
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
@@ -173,7 +160,7 @@ teacher_std = jax.nn.sigmoid(teacher_std_logits)
 
 expert_demo = False
 if expert_demo:
-    with open("output/MORL/test/policy.msgpack", "rb") as f:
+    with open("output/MORL/test4/policy.msgpack", "rb") as f:
         encoded_bytes = f.read()
     expert_params = serialization.from_bytes(policy_template, encoded_bytes)
 else:
@@ -267,33 +254,33 @@ if need_distill:
     else:
         dummy = jnp.ones_like(combined_transitions.td_lambda_returns) # distill teacher
 
-        loop_random_key, subkey = jax.random.split(loop_random_key)
+        # loop_random_key, subkey = jax.random.split(loop_random_key)
 
-        # # random sample
-        preference_part_1 = jax.random.normal(subkey, (num_collect_iterations, 64, vec_env, 2)) # <--- all independent
-        loop_random_key, subkey = jax.random.split(loop_random_key)
-        preference_part_2 = jnp.abs(jax.random.normal(subkey, (num_collect_iterations, 64, vec_env, 3))) # <--- all independent
-        # preferences = combined_transitions.zs[..., 8:] * 0.0 + jnp.concatenate([preference_part_1, preference_part_2], axis=-1)
-        preferences = jnp.concatenate([preference_part_1, preference_part_2], axis=-1)
+        # # # random sample
+        # preference_part_1 = jax.random.normal(subkey, (num_collect_iterations, 64, vec_env, 2)) # <--- all independent
+        # loop_random_key, subkey = jax.random.split(loop_random_key)
+        # preference_part_2 = jnp.abs(jax.random.normal(subkey, (num_collect_iterations, 64, vec_env, 3))) # <--- all independent
+        # # preferences = combined_transitions.zs[..., 8:] * 0.0 + jnp.concatenate([preference_part_1, preference_part_2], axis=-1)
+        # preferences = jnp.concatenate([preference_part_1, preference_part_2], axis=-1)
 
-        # preference_noise = jax.random.normal(subkey, (num_collect_iterations, 1, vec_env, 5)) * 0.4
-        # preferences = combined_transitions.zs[..., 8:] # (18, 64, 4096, 5)
-        # preferences = jnp.clip(preferences + preference_noise, min=jnp.array([-100, -100, 0, 0, 0]))
+        # # preference_noise = jax.random.normal(subkey, (num_collect_iterations, 1, vec_env, 5)) * 0.4
+        # # preferences = combined_transitions.zs[..., 8:] # (18, 64, 4096, 5)
+        # # preferences = jnp.clip(preferences + preference_noise, min=jnp.array([-100, -100, 0, 0, 0]))
 
-        # according to reward
-        # preferences = jnp.mean(combined_transitions.mo_rewards, axis=1, keepdims=True)
-        # preferences = combined_transitions.zs[..., 8:] * 0.0 + preferences
+        # # according to reward
+        # # preferences = jnp.mean(combined_transitions.mo_rewards, axis=1, keepdims=True)
+        # # preferences = combined_transitions.zs[..., 8:] * 0.0 + preferences
 
-        preferences = preferences / jnp.linalg.norm(preferences, axis=-1, keepdims=True)
+        # preferences = preferences / jnp.linalg.norm(preferences, axis=-1, keepdims=True)
 
-        new_zs = jnp.concatenate([combined_transitions.zs[..., :8], preferences], axis=-1)
+        # new_zs = jnp.concatenate([combined_transitions.zs[..., :8], preferences], axis=-1)
 
 
         relocated_demonstrations = PPOTransition(
             obs=combined_transitions.obs,
             actions=combined_transitions.actions,
-            # zs=combined_transitions.zs,
-            zs=new_zs,
+            zs=combined_transitions.zs,
+            # zs=new_zs,
             log_likelihood=combined_transitions.log_likelihood,
             rewards=dummy,
             td_lambda_returns=dummy,

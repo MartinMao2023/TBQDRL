@@ -23,7 +23,7 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 8192
-num_iterations = 8000
+num_iterations = 2000
 policy_epochs = 4
 critic_epochs = 4
 # policy_learning_rate_per_std = 1e-3 # unified
@@ -86,7 +86,7 @@ ppo_config = PPOConfigs(
 
 
 # seed = 8848
-seed = 7765498
+seed = 4242
 loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
@@ -102,7 +102,7 @@ policy_network = GC_PPO_Policy(
     initial_std=0.1 * jnp.ones(env.action_size),
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
-    activation=nn.softplus,
+    activation=nn.silu,
     final_activation=jnp.tanh,
     learnable_std=True,
 )
@@ -110,7 +110,7 @@ policy_network = GC_PPO_Policy(
 critic_network = GCMLP(
     layer_sizes=critic_hidden_layers + (1,),
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
-    activation=nn.softplus,
+    activation=nn.silu,
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
 )
 
@@ -125,8 +125,6 @@ ppo = PPO(
 loop_random_key, subkey = jax.random.split(loop_random_key)
 ppo_training_state = ppo.init(subkey)
 
-seed = 8848
-loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
 states = jax.vmap(env.reset)(subkeys)
@@ -207,9 +205,9 @@ for i in range(int(num_iterations / log_period)):
 
     carry = (states, ppo_training_state, loop_random_key)
 
-    if jnp.mean(iteration_mean_return) > 200:
-        print("early break!")
-        break
+    # if jnp.mean(iteration_mean_return) > 200:
+    #     print("early break!")
+    #     break
 
 
 # =================================
@@ -226,7 +224,7 @@ model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
 critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
 
 
-folder_path = f"./output/MORL/test2"
+folder_path = f"./output/MORL/test4"
 
 if not os.path.exists(folder_path):
     os.makedirs(folder_path, exist_ok=True)
@@ -240,8 +238,7 @@ with open(folder_path + f"/critic.msgpack", "wb") as f:
 
 jnp.save(folder_path + "/mean.npy", final_ppo_training_state.moving_mean)
 jnp.save(folder_path + "/var.npy", final_ppo_training_state.moving_squared_diff)
-
-print(jnp.sqrt(final_ppo_training_state.moving_mse))
+jnp.save(folder_path + "/mse.npy", final_ppo_training_state.moving_mse)
 
 wandb.finish()
 
