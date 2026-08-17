@@ -381,7 +381,12 @@ class Relocator:
         weights = jnp.asarray(w_tiled[perm])
         dummy = jnp.zeros((n_used, 1))
 
-        print("average GAE:", jnp.mean(weights))
+        mean_gae = jnp.mean(weights)
+        gae_std = jnp.std(weights)
+        print("average GAE:", mean_gae)
+        print("GAE std:", gae_std)
+        # weights=jnp.clip(weights / (1e-6 + mean_gae), max=10.0)
+        weights = jnp.clip(weights, max=mean_gae + 3 * gae_std) / (1e-6 + mean_gae)
 
         return PPOTransition(
             obs=jnp.asarray(obs_tiled[perm]),
@@ -393,7 +398,7 @@ class Relocator:
             gaes=dummy,
             dones=dummy,
             truncations=dummy,
-            weights=weights / (1e-6 + jnp.mean(weights)),
+            weights=weights,
         )
 
     # ---------------------------------------------- per-trajectory values / rewards
@@ -401,17 +406,51 @@ class Relocator:
     def _compute_values(self, all_obs_t, all_la_t, mo_r_t, best_p):
         """Critic values (incl. final state) and scalarized rewards per traj.
 
+        Memory-friendly: the N axis is chunked into blocks of `self.chunk_size`
+        (1024) and the critic apply is run one block at a time via
+        jax.lax.scan, so peak activation memory is bounded by the chunk
+        size rather than by N.
+
         all_obs_t (N, 65, obs_dim), all_la_t (N, 65, act_dim),
         mo_r_t (N, 64, mo_dim), best_p (N, 5).
         Returns v_values (N, 65, 1), rewards (N, 64, 1).
         """
-        zs = jnp.concatenate(
-            [all_la_t, jnp.broadcast_to(best_p[:, None, :], all_la_t.shape[:2] + (best_p.shape[-1],))],
-            axis=-1,
-        )  # (N, 65, z_dim)
-        v_values = self.critic_network.apply(self.critic_params, all_obs_t, zs) \
-            * self.moving_std + self.moving_mean  # (N, 65, 1)
-        rewards = jnp.sum(mo_r_t * best_p[:, None, :], axis=-1, keepdims=True)  # (N, 64, 1)
+        N = all_obs_t.shape[0]
+        chunk = self.chunk_size  # 1024
+        n_chunks = (N + chunk - 1) // chunk  # ceil(N / chunk)
+        pad = n_chunks * chunk - N
+
+        def pad_to(x):
+            if pad == 0:
+                return x
+            return jnp.concatenate(
+                [x, jnp.zeros((pad,) + x.shape[1:], dtype=x.dtype)], axis=0
+            )
+
+        # (n_chunks, chunk, ...)
+        obs_c = pad_to(all_obs_t).reshape(n_chunks, chunk, *all_obs_t.shape[1:])
+        la_c = pad_to(all_la_t).reshape(n_chunks, chunk, *all_la_t.shape[1:])
+        mr_c = pad_to(mo_r_t).reshape(n_chunks, chunk, *mo_r_t.shape[1:])
+        bp_c = pad_to(best_p).reshape(n_chunks, chunk, *best_p.shape[1:])
+
+        def step(carry, blk):
+            obs_b, la_b, mr_b, bp_b = blk
+            zs = jnp.concatenate(
+                [la_b, jnp.broadcast_to(bp_b[:, None, :], la_b.shape[:2] + (bp_b.shape[-1],))],
+                axis=-1,
+            )  # (chunk, 65, z_dim)
+            v = self.critic_network.apply(self.critic_params, obs_b, zs) \
+                * self.moving_std + self.moving_mean  # (chunk, 65, 1)
+            r = jnp.sum(mr_b * bp_b[:, None, :], axis=-1, keepdims=True)  # (chunk, 64, 1)
+            return carry, (v, r)
+
+        _, (v_values_c, rewards_c) = jax.lax.scan(
+            step, None, (obs_c, la_c, mr_c, bp_c)
+        )  # each (n_chunks, chunk, ...)
+
+        # flatten the chunk axis and drop the padding
+        v_values = v_values_c.reshape(n_chunks * chunk, *v_values_c.shape[2:])[:N]
+        rewards = rewards_c.reshape(n_chunks * chunk, *rewards_c.shape[2:])[:N]
         return v_values, rewards
 
     # ------------------------------------------------- orchestration
@@ -462,9 +501,12 @@ class Relocator:
             all_obs_c, all_la_c, mo_r_c, opt_key
         )
 
+        print("optimization complete")
+
         # ---- per-step GAE of the selected trunks ----
         # v_values (N, 65, 1), rewards (N, 64, 1) under the best preference.
         v_values, rewards = self._compute_values(all_obs_t, all_la_t, mo_r_t, best_p)
+        print("value compute complete")
         # time-major (T+1, B, 1) / (T, B, 1) for the reverse scan + vmap.
         v_tm = jnp.transpose(v_values, (1, 0, 2))      # (65, N, 1)
         r_tm = jnp.transpose(rewards, (1, 0, 2))        # (64, N, 1)
@@ -473,6 +515,7 @@ class Relocator:
         )  # (64, N, 1)
         gae_tm = jnp.clip(td_lambda_return - v_tm[:-1], min=0)  # (64, N, 1)
         gae_t = jnp.transpose(gae_tm, (1, 0, 2))         # (N, 64, 1)
+        print("GAE calculation complete")
 
         return self.reorganize(
             obs_t, la_t, act_t, ll_t, dones_t, truncs_t,

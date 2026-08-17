@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 
 import flax.linen as nn
@@ -39,7 +39,7 @@ mini_batch_size = 8192
 num_iterations = 1000
 policy_epochs = 4
 critic_epochs = 4
-policy_learning_rate_per_std = 5e-4  # unified (used for the GMM student distil lr)
+policy_learning_rate_per_std = 1e-3  # unified (used for the GMM student distil lr)
 selector_learning_rate = 1e-4
 critic_learning_rate = 5e-4
 ppo_rollout_length = 32
@@ -83,11 +83,13 @@ critic_network = GCMLP(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
 )
 
-seed = 4455
+seed = 445566
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 
 folder_path = "output/MORL/test3"
+# folder_path = "output/MORL/ant_mo_70"
+# folder_path = "output/MORL/ant_mo_long"
 # folder_path = "output/MORL/test"
 
 with open(folder_path + "/policy.msgpack", "rb") as f:
@@ -110,7 +112,7 @@ moving_std = jnp.sqrt(jnp.load(folder_path + "/var.npy"))
 
 loop_random_key, subkey = jax.random.split(loop_random_key)
 k1 = 0
-k2 = 1
+k2 = 4
 component_num = k1 + k2
 if component_num > 1:
     component_means = jnp.concatenate([
@@ -355,31 +357,6 @@ if need_distill:
 
 
 
-if expert_demo:
-    group_name = "200 learn from 300"
-else:
-    group_name = "relocation combined"
-
-
-wandb_config = {
-    "task": "relocation ablation: relocated-only distil + selector",
-    "vec_env": vec_env,
-    "mini_batch_size": mini_batch_size,
-    "num_iterations": num_iterations,
-    "policy_epochs": policy_epochs,
-    "critic_epochs": critic_epochs,
-    "selector_learning_rate": selector_learning_rate,
-    "policy_learning_rate_per_std": policy_learning_rate_per_std,
-    "critic_learning_rate": critic_learning_rate,
-    "ppo_rollout_length": ppo_rollout_length,
-    "use_dropout_rollout": False,
-}
-wandb.init(
-    entity="airl-lab",
-    group=group_name,
-    project="TBQDRL",
-    config=wandb_config,
-)
 
 print(f"k1: {k1}, component num: {component_num}")
 
@@ -391,7 +368,7 @@ ppo_config = PPOConfigs(
     entropy_gain=0.001,
     discount=0.99,
     td_lambda_discount=0.95,
-    rollout_length=rollout_length,
+    rollout_length=ppo_rollout_length,
     vec_env=vec_env,
     mini_batch_size=mini_batch_size,
     critic_epochs=critic_epochs,
@@ -430,6 +407,7 @@ selector_training_state = selector_training_state.replace(
     moving_mean=moving_mean,
     moving_squared_diff=jnp.square(moving_std),
     iteration_num=5000,
+    moving_mse=300,
 )
 
 # fresh key for the selector PPO phase (matches main_ant_GMM.py convention)
@@ -463,6 +441,33 @@ def training_loop(carry, _):
         aux_data.training_data.clip_fraction,
         aux_data.rollout_data.average_return,
     )
+
+
+if expert_demo:
+    group_name = "200 learn from 300"
+else:
+    group_name = "relocation combined"
+
+
+wandb_config = {
+    "task": "relocation ablation: relocated-only distil + selector",
+    "vec_env": vec_env,
+    "mini_batch_size": mini_batch_size,
+    "num_iterations": num_iterations,
+    "policy_epochs": policy_epochs,
+    "critic_epochs": critic_epochs,
+    "selector_learning_rate": selector_learning_rate,
+    "policy_learning_rate_per_std": policy_learning_rate_per_std,
+    "critic_learning_rate": critic_learning_rate,
+    "ppo_rollout_length": ppo_rollout_length,
+    "use_dropout_rollout": False,
+}
+wandb.init(
+    entity="airl-lab",
+    group=group_name,
+    project="TBQDRL",
+    config=wandb_config,
+)
 
 
 log_period = 10
