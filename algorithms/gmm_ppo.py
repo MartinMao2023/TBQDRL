@@ -45,6 +45,7 @@ class PPORollout(PyTreeNode):
     rewards: jax.Array
     dones: jax.Array
     truncations: jax.Array
+    selection_entropy: jax.Array
 
 
 class TrainingData(PyTreeNode):
@@ -81,6 +82,7 @@ class PPOMetrics(PyTreeNode):
     done_count: jax.Array
     gae_mean: jax.Array
     gae_std: jax.Array
+    selection_entropy: jax.Array
 
 
 class PPO:
@@ -210,6 +212,8 @@ class PPO:
             obs, z = self._env.get_obs(state)
             action_means, _ = self._policy_network.apply(policy_params, obs, z)
             weight_logits = self._selector_network.apply(selector_params, obs, z)
+            selection_entropy = nn.logsumexp(weight_logits) \
+                - jnp.sum(nn.softmax(weight_logits) * weight_logits)
 
             key, selection_key, noise_key = jax.random.split(key, 3)
             component_index = jax.random.categorical(selection_key, weight_logits)
@@ -243,6 +247,7 @@ class PPO:
                 rewards=transition_info.reward,
                 dones=transition_info.done,
                 truncations=transition_info.truncation,
+                selection_entropy=jnp.expand_dims(selection_entropy, axis=-1),
             )
             return (next_state, sampled_state, episode_length, key), transition
 
@@ -491,10 +496,12 @@ class PPO:
             (one - statistics_learning_rate) * training_state.moving_mean
             + statistics_learning_rate * average_return
         )
-        moving_squared_diff = (
+        moving_squared_diff = jnp.maximum(
             (one - statistics_learning_rate) * training_state.moving_squared_diff
-            + statistics_learning_rate * jnp.mean(jnp.square(critic_targets - moving_mean))
+            + statistics_learning_rate * jnp.mean(jnp.square(critic_targets - moving_mean)),
+            one,
         )
+        moving_std = jnp.sqrt(moving_squared_diff)
         moving_mse = (
             (one - mse_learning_rate) * training_state.moving_mse
             + mse_learning_rate * jnp.mean(jnp.square(raw_gaes))
@@ -508,13 +515,8 @@ class PPO:
         )
         normalized_critic_targets = (
             clipped_critic_targets - moving_mean
-        ) / (1e-6 + jnp.sqrt(moving_squared_diff))
+        ) / moving_std
 
-
-
-
-
-        # ==================================================
         shuffled_indices = self._make_shuffle_indices(shuffle_key)
         training_data = self._shuffle_data(
             TrainingData(
@@ -528,12 +530,6 @@ class PPO:
             ),
             shuffled_indices,
         )
-        # ==================================================
-
-
-
-
-
 
         critic_params, critic_opt_state, critic_rmse, = self._update_critic(
             training_state.critic_params,
@@ -578,12 +574,13 @@ class PPO:
             lr_scale=lr_scale,
         )
         metrics = PPOMetrics(
-            critic_rmse=critic_rmse * jnp.sqrt(moving_squared_diff),
+            critic_rmse=critic_rmse * moving_std,
             policy_approx_kl=policy_approx_kl,
             average_reward=jnp.mean(rollout_data.rewards),
             average_return=average_return,
             done_count=jnp.sum(rollout_data.dones),
             gae_mean=gae_mean,
             gae_std=gae_std,
+            selection_entropy=jnp.mean(rollout_data.selection_entropy),
         )
         return (final_states, sampled_states, training_state, key), metrics

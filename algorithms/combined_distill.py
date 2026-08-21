@@ -13,7 +13,7 @@ from data_struct import PPOTransition
 from custom_types import Params, RNGKey
 from flax.struct import PyTreeNode
 from task_wrappers.base import BaseTaskWrapper
-from networks import GC_multi_Policy, GC_Selector
+from networks import Multi_Action_PPO_Policy, Selector
 
 
 @dataclass
@@ -73,8 +73,8 @@ class CombinedDistill:
     def __init__(
         self,
         env: BaseTaskWrapper,
-        policy_network: GC_multi_Policy,
-        selector_network: GC_Selector,
+        policy_network: Multi_Action_PPO_Policy,
+        selector_network: Selector,
         teacher_std_logits: jax.Array,
         bc_configs: CombinedDistillConfigs,
     ):

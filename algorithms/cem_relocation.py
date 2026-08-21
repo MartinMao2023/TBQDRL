@@ -17,8 +17,8 @@ The search is a random-search + local-refinement scheme:
 
 This module is organised as a ``Relocator`` class. The per-step GAE of the
 selected trunks is computed by :meth:`Relocator.calculate_td_lambda_return`
-(currently a placeholder); until that is filled in, ``reorganize`` falls back
-to broadcasting the scalar trajectory score as the per-step weight.
+(currently a placeholder); ``reorganize`` currently leaves GAE / weights as
+dummy and only slices, concatenates, and marks truncations.
 """
 
 from data_struct.relocation_transitions import MORelocationTransition
@@ -40,7 +40,7 @@ class Relocator:
     Workflow:
         1. ``optimize_all``   -> (best_p, best_s, best_e, best_score) per traj
         2. ``calculate_td_lambda_return`` -> per-step GAE of the trunks
-        3. ``reorganize``     -> slice / concat / tile / shuffle -> PPOTransition
+        3. ``reorganize``     -> index table / shuffle / concat slices -> PPOTransition
     """
 
     def __init__(
@@ -201,112 +201,131 @@ class Relocator:
         best_score = bsc.reshape(num_traj)
         return best_p, best_s, best_e, best_score
 
-    # ------------------------------------------------- per-step GAE (placeholder)
-    def calculate_td_lambda_return(
+
+
+    @partial(jax.jit, static_argnames=("self",))
+    def compute_lambda_return_and_GAE(
         self,
-        v_values: jax.Array,
-        rewards: jax.Array,
-        end_indices: jax.Array,
-    ) -> jax.Array:
-        """Per-step GAE-lambda of the relocated trunks. PLACEHOLDER.
-
-        Inputs are time-major to allow a jax.lax.scan over time with a
-        jax.vmap over the batch inside it:
-            v_values       (T+1, B, 1)  critic values incl. the final state
-            rewards        (T,   B, 1)  scalarized rewards (mo_rewards . best_p)
-            start_indices  (B,)        trunk start per trajectory
-            end_indices    (B,)        trunk end per trajectory (bootstrap idx)
-
-        Returns:
-            gae            (T, B, 1)   GAE = td_lambda - v, zero outside
-                                       [start, end); bootstrap = v_values[end].
-
-        Implementation notes (to be filled in):
-          * reverse jax.lax.scan over time, jax.vmap over batch;
-          * done / truncation are ignored (trajectories containing them are
-            discarded before this stage);
-          * position mask: td[t+1] = v_values[end] for any t+1 >= end.
+        critic_params,
+        moving_mean,
+        moving_std,
+        transitions: PPOTransition,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Reverse TD(lambda) / GAE on packed transitions reshaped to (M, L).
         """
         discount = 0.99
-        td_lambda_discount = 0.95
-        rollout_length = rewards.shape[0]   # T
-        batch_size = rewards.shape[1]       # B
+        gae_lambda = 0.95
+        L = self.e_max
+        n = transitions.obs.shape[0]
+        M = n // L
 
-        # Per-batch bootstrap value v_values[end] (the trunk's terminal state),
-        # used only to seed the reverse scan's initial carry.
-        v_end = v_values[end_indices, jnp.arange(batch_size)]  # (B, 1)
+        def to_time_major(x):
+            return jnp.transpose(x.reshape(M, L, x.shape[-1]), (1, 0, 2))
 
-        def scan_calculate_td_lambda(carry, data):
-            # carry (per batch): last_td = td[t+1], last_value = v[t+1],
-            # t = current step index, end = trunk end index.
-            last_td, t, end = carry
-            reward, v_value = data  # reward[t], v[t]
+        obs = to_time_major(transitions.obs)
+        zs = to_time_major(transitions.zs)
+        rewards = to_time_major(transitions.rewards)
+        truncations = to_time_major(transitions.truncations)
 
-            # standard TD(lambda) recursion (no done/trunc: such trajs discarded)
-            td = reward + discount * (
-                (1 - td_lambda_discount) * v_value
-                + td_lambda_discount * last_td
+        def step1(carry, data):
+            last_target, last_v_value, t = carry
+            obs_t, zs_t, reward, truncation = data
+            v_value = (
+                self.critic_network.apply(critic_params, obs_t, zs_t)
+                * moving_std + moving_mean
             )
+            bootstrap = (truncation > 0.5) | (t == 0)
+            target = jnp.where(
+                bootstrap,
+                v_value,
+                reward + discount * (
+                    gae_lambda * last_target + (1 - gae_lambda) * last_v_value
+                ),
+            )
+            return (target, v_value, t + 1), v_value
 
-            td = jnp.where(t >= end, last_td, td)
 
-            return (td, t - 1, end), td
+        def step2(carry, data):
+            last_target, last_v_value = carry
+            reward, truncation, v_value = data
+            bootstrap = truncation > 0.5
+            target = jnp.where(
+                bootstrap,
+                v_value,
+                reward + discount * (
+                    gae_lambda * last_target + (1 - gae_lambda) * last_v_value
+                ),
+            )
+            gae = target - v_value
+            return (target, v_value), (target, gae)
 
-        _, td_lambda_values = jax.lax.scan(
-            jax.vmap(scan_calculate_td_lambda),
-            (
-                v_end,                                                       # last_td                                                      # last_value
-                jnp.full((batch_size,), rollout_length - 1, dtype=jnp.int32),  # t = T-1
-                end_indices,                                                  # end per batch
-            ),
-            (rewards, v_values[1:]),
-            reverse=True,
-        )  # (T, B, 1)
+        init = (jnp.zeros((M, 1)), jnp.zeros((M, 1)), jnp.int32(0))
+        starting_carry, v_values = jax.lax.scan(
+            step1, init, (obs, zs, rewards, truncations), reverse=True,
+        )
+        init_target = jnp.roll(starting_carry[0], -1, axis=0)
+        init_last_v = jnp.roll(starting_carry[1], -1, axis=0)
 
-        return td_lambda_values
+        _, (td_lambda, gae) = jax.lax.scan(
+            step2, (init_target, init_last_v), (rewards, truncations, v_values), reverse=True,
+        )
+
+        def to_flat(x):
+            return jnp.transpose(x, (1, 0, 2)).reshape(n, x.shape[-1])
+
+        return to_flat(td_lambda), to_flat(gae)
     
+
     # ------------------------------------------------- post-processing (Python)
     def reorganize(
         self,
         obs_t: jax.Array,
         la_t: jax.Array,
         act_t: jax.Array,
-        ll_t: jax.Array,
         dones_t: jax.Array,
         truncs_t: jax.Array,
+        mo_r_t: jax.Array,
         best_p: jax.Array,
         best_s: jax.Array,
         best_e: jax.Array,
         best_score: jax.Array,
-        gae_t: jax.Array,
         shuf_key: jax.Array,
         max_data_size=None,
     ) -> PPOTransition:
-        """Slice the selected trunks, concat, tile back to `n_used`, shuffle.
+        """Build a shuffle table, concat selected slices until ``n_used``.
 
-        ``best_score`` drives selection (positive) and the done/trunc
-        discard; the per-step weight of each selected trunk is the
-        corresponding slice of ``gae_t`` (the per-step GAE =
-        ``td_lambda_return - v_values`` produced by
-        :meth:`calculate_td_lambda_return`).
+        Table columns are ``(traj_idx, start, end, if_use)`` with inclusive
+        ``end`` clipped to the last transition index (``rollout_len - 1``;
+        ``best_e`` may point at the extra bootstrap state in ``all_obs``).
+        ``if_use`` is 0 when ``best_score`` is non-positive or the trajectory
+        contains a done / truncation. Trajectories are shuffled, then usable
+        ``(i, s, e)`` pairs are collected (last ``e`` cut to fit ``n_used``).
+        Fields are packed to a 3D tensor and sliced with ``s:e+1``. Truncation
+        is 1.0 at each segment's last step (``cumsum(lengths) - 1``).
         """
         num_traj, rollout_len = obs_t.shape[0], obs_t.shape[1]
-        obs_dim = obs_t.shape[-1]
-        act_dim = act_t.shape[-1]
-        pref_dim = best_p.shape[-1]
+        last_t = rollout_len - 1  # 63 when rollout_len is 64
 
         if max_data_size is None:
             n_used = num_traj * rollout_len
         else:
             n_used = max_data_size
 
-        # discard trajectories that contain any done / truncation
-        has_term = (dones_t.sum(axis=1) + truncs_t.sum(axis=1)) > 0  # (N, 1)
-        best_score = jnp.where(has_term[:, 0], jnp.float32(-1000.0), best_score)
+        has_term = (dones_t.sum(axis=1) + truncs_t.sum(axis=1))[:, 0] > 0
+        if_use = (best_score > 0) & (~has_term)
+        end_clipped = jnp.minimum(best_e, jnp.int32(last_t))
+        table = jnp.stack(
+            [
+                jnp.arange(num_traj, dtype=jnp.int32),
+                best_s.astype(jnp.int32),
+                end_clipped.astype(jnp.int32),
+                if_use.astype(jnp.int32),
+            ],
+            axis=1,
+        )  # (num_traj, 4)
 
-        selected_mask = best_score > 0
-        n_traj_sel = float(jnp.sum(selected_mask))
-        seg_lens = jnp.where(selected_mask, best_e - best_s, 0)
+        n_traj_sel = float(jnp.sum(if_use))
+        seg_lens = jnp.where(if_use, end_clipped - best_s + 1, 0)
         n_trans_sel = float(jnp.sum(seg_lens))
         print(
             f"portion trajectories selected: {n_traj_sel / num_traj:.4f}  "
@@ -317,143 +336,87 @@ class Relocator:
             f"({n_trans_sel:.0f}/{n_used})"
         )
         if n_traj_sel > 0:
-            avg_sel = float(jnp.mean(best_score[selected_mask]))
+            avg_sel = float(jnp.mean(best_score[if_use]))
             print(f"avg best_score (selected): {avg_sel:.4f}")
         else:
             print("avg best_score (selected): N/A (none selected)")
 
-        obs_np = np.asarray(obs_t)
-        act_np = np.asarray(act_t)
-        la_np = np.asarray(la_t)
-        ll_np = np.asarray(ll_t)
-        bp_np = np.asarray(best_p)
-        bs_np = np.asarray(best_s).astype(int)
-        be_np = np.asarray(best_e).astype(int)
-        bsc_np = np.asarray(best_score).astype(float)
-        gae_np = np.asarray(gae_t)  # (num_traj, rollout_len, 1)
-
-        obs_list, z_list, act_list, w_list, ll_list = [], [], [], [], []
-        for i in range(num_traj):
-            sc = bsc_np[i]
-            if sc > 0:
-                s = int(bs_np[i])
-                e = int(be_np[i])
-                L = e - s
-                obs_list.append(obs_np[i, s:e])
-                act_list.append(act_np[i, s:e])
-                seg_la = la_np[i, s:e]
-                seg_ll = ll_np[i, s:e]
-                seg_p = np.broadcast_to(bp_np[i], (L, pref_dim))
-                z_list.append(np.concatenate([seg_la, seg_p], axis=-1))
-                # per-step weight: the GAE of the selected trunk.
-                w_list.append(gae_np[i, s:e])
-                ll_list.append(seg_ll)
-
-        if len(obs_list) > 0:
-            obs_sel = np.concatenate(obs_list, axis=0)
-            z_sel = np.concatenate(z_list, axis=0)
-            act_sel = np.concatenate(act_list, axis=0)
-            w_sel = np.concatenate(w_list, axis=0)
-            ll_sel = np.concatenate(ll_list, axis=0)
-        else:
-            obs_sel = obs_np.reshape(n_used, obs_dim)
-            act_sel = act_np.reshape(n_used, act_dim)
-            la_flat = la_np.reshape(n_used, act_dim)
-            ll_flat = ll_np.reshape(n_used, 1)
-            p_flat = np.broadcast_to(
-                bp_np, (num_traj, rollout_len, pref_dim)
-            ).reshape(n_used, pref_dim)
-            z_sel = np.concatenate([la_flat, p_flat], axis=-1)
-            w_sel = np.zeros((n_used, 1), dtype=np.float32)
-            ll_sel = ll_flat
-
-        N_sel = obs_sel.shape[0]
-        repeats = n_used // N_sel + 1
-        obs_tiled = np.tile(obs_sel, (repeats, 1))[:n_used]
-        z_tiled = np.tile(z_sel, (repeats, 1))[:n_used]
-        act_tiled = np.tile(act_sel, (repeats, 1))[:n_used]
-        w_tiled = np.tile(w_sel, (repeats, 1))[:n_used]
-        ll_tiled = np.tile(ll_sel, (repeats, 1))[:n_used]
-
-        seed_int = int(np.asarray(shuf_key).flat[0])
-        rng = np.random.default_rng(seed_int)
-        perm = rng.permutation(n_used)
-        weights = jnp.asarray(w_tiled[perm])
-        dummy = jnp.zeros((n_used, 1))
-
-        mean_gae = jnp.mean(weights)
-        gae_std = jnp.std(weights)
-        print("average GAE:", mean_gae)
-        print("GAE std:", gae_std)
-        # weights=jnp.clip(weights / (1e-6 + mean_gae), max=10.0)
-        weights = jnp.clip(weights, max=mean_gae + 3 * gae_std) / (1e-6 + mean_gae)
-
-        return PPOTransition(
-            obs=jnp.asarray(obs_tiled[perm]),
-            actions=jnp.asarray(act_tiled[perm]),
-            zs=jnp.asarray(z_tiled[perm]),
-            log_likelihood=jnp.asarray(ll_tiled[perm]),
-            rewards=dummy,
-            td_lambda_returns=dummy,
-            gaes=dummy,
-            dones=dummy,
-            truncations=dummy,
-            weights=weights,
+        dummy_step = jnp.zeros((num_traj, rollout_len, 1))
+        scalar_r = jnp.sum(mo_r_t * best_p[:, None, :], axis=-1, keepdims=True)
+        packed = PPOTransition(
+            obs=obs_t,
+            actions=act_t,
+            zs=jnp.concatenate(
+                [
+                    la_t,
+                    jnp.broadcast_to(
+                        best_p[:, None, :],
+                        (num_traj, rollout_len, best_p.shape[-1]),
+                    ),
+                ],
+                axis=-1,
+            ),
+            log_likelihood=dummy_step,
+            rewards=scalar_r,
+            td_lambda_returns=dummy_step,
+            gaes=dummy_step,
+            dones=dummy_step,
+            truncations=dummy_step,
+            weights=dummy_step,
         )
 
-    # ---------------------------------------------- per-trajectory values / rewards
-    @partial(jax.jit, static_argnames=("self",))
-    def _compute_values(self, all_obs_t, all_la_t, mo_r_t, best_p):
-        """Critic values (incl. final state) and scalarized rewards per traj.
+        table = np.asarray(table[jax.random.permutation(shuf_key, num_traj)], dtype=np.int32)
+        used = table[table[:, 3] == 1]
+        n_rows = used.shape[0]
+        del table
 
-        Memory-friendly: the N axis is chunked into blocks of `self.chunk_size`
-        (1024) and the critic apply is run one block at a time via
-        jax.lax.scan, so peak activation memory is bounded by the chunk
-        size rather than by N.
-
-        all_obs_t (N, 65, obs_dim), all_la_t (N, 65, act_dim),
-        mo_r_t (N, 64, mo_dim), best_p (N, 5).
-        Returns v_values (N, 65, 1), rewards (N, 64, 1).
-        """
-        N = all_obs_t.shape[0]
-        chunk = self.chunk_size  # 1024
-        n_chunks = (N + chunk - 1) // chunk  # ceil(N / chunk)
-        pad = n_chunks * chunk - N
-
-        def pad_to(x):
-            if pad == 0:
-                return x
-            return jnp.concatenate(
-                [x, jnp.zeros((pad,) + x.shape[1:], dtype=x.dtype)], axis=0
+        if n_rows == 0:
+            print("no usable trunks; returning dummy batch")
+            dummy = jnp.zeros((n_used, 1))
+            return PPOTransition(
+                obs=jnp.zeros((n_used, obs_t.shape[-1])),
+                actions=jnp.zeros((n_used, act_t.shape[-1])),
+                zs=jnp.zeros((n_used, packed.z_dim)),
+                log_likelihood=dummy,
+                rewards=dummy,
+                td_lambda_returns=dummy,
+                gaes=dummy,
+                dones=dummy,
+                truncations=dummy,
+                weights=dummy,
             )
 
-        # (n_chunks, chunk, ...)
-        obs_c = pad_to(all_obs_t).reshape(n_chunks, chunk, *all_obs_t.shape[1:])
-        la_c = pad_to(all_la_t).reshape(n_chunks, chunk, *all_la_t.shape[1:])
-        mr_c = pad_to(mo_r_t).reshape(n_chunks, chunk, *mo_r_t.shape[1:])
-        bp_c = pad_to(best_p).reshape(n_chunks, chunk, *best_p.shape[1:])
+        flat3d = np.asarray(
+            packed.flatten().reshape(num_traj, rollout_len, packed.flatten_dim)
+        )
+        pairs = []
+        n = 0
+        k = 0
+        print("starting loop")
+        while n < n_used:
+            i, s, e = int(used[k, 0]), int(used[k, 1]), int(used[k, 2])
+            L = e - s + 1  # inclusive end
+            if n + L > n_used:
+                e = s + (n_used - n) - 1
+                L = e - s + 1
+            pairs.append((i, s, e))
+            n += L
+            k += 1
+            if k == n_rows:
+                k = 0
+        print("loop end")
 
-        def step(carry, blk):
-            obs_b, la_b, mr_b, bp_b = blk
-            zs = jnp.concatenate(
-                [la_b, jnp.broadcast_to(bp_b[:, None, :], la_b.shape[:2] + (bp_b.shape[-1],))],
-                axis=-1,
-            )  # (chunk, 65, z_dim)
-            v = self.critic_network.apply(self.critic_params, obs_b, zs) \
-                * self.moving_std + self.moving_mean  # (chunk, 65, 1)
-            r = jnp.sum(mr_b * bp_b[:, None, :], axis=-1, keepdims=True)  # (chunk, 64, 1)
-            return carry, (v, r)
+        lengths = np.array([e - s + 1 for _, s, e in pairs], dtype=np.int32)
+        truncation = np.zeros((n_used, 1), dtype=np.float32)
+        truncation[np.cumsum(lengths) - 1] = 1.0
 
-        _, (v_values_c, rewards_c) = jax.lax.scan(
-            step, None, (obs_c, la_c, mr_c, bp_c)
-        )  # each (n_chunks, chunk, ...)
+        flat = jnp.asarray(
+            np.concatenate([flat3d[i, s : e + 1] for i, s, e in pairs], axis=0)
+        )
+        out = PPOTransition.from_flatten(flat, packed)
+        return out.replace(truncations=jnp.asarray(truncation))
 
-        # flatten the chunk axis and drop the padding
-        v_values = v_values_c.reshape(n_chunks * chunk, *v_values_c.shape[2:])[:N]
-        rewards = rewards_c.reshape(n_chunks * chunk, *rewards_c.shape[2:])[:N]
-        return v_values, rewards
 
-    # ------------------------------------------------- orchestration
     def relocate(
         self,
         transitions: MORelocationTransition,
@@ -484,7 +447,6 @@ class Relocator:
         obs_t = all_obs_t[:, :rollout_len, :]
         la_t = all_la_t[:, :rollout_len, :]
         act_t = to_traj(transitions.actions)
-        ll_t = to_traj(transitions.log_likelihood)
         dones_t = to_traj(transitions.dones)
         truncs_t = to_traj(transitions.truncations)
 
@@ -496,31 +458,41 @@ class Relocator:
         )
         mo_r_c = mo_r_t.reshape(num_chunks, self.chunk_size, *mo_r_t.shape[1:])
 
-        key, opt_key, gae_key, shuf_key = jax.random.split(key, 4)
+        key, opt_key, shuf_key = jax.random.split(key, 3)
         best_p, best_s, best_e, best_score = self.optimize_all(
             all_obs_c, all_la_c, mo_r_c, opt_key
         )
 
         print("optimization complete")
+        del all_obs_c, all_obs_t, all_obs, all_la_t
 
-        # ---- per-step GAE of the selected trunks ----
-        # v_values (N, 65, 1), rewards (N, 64, 1) under the best preference.
-        v_values, rewards = self._compute_values(all_obs_t, all_la_t, mo_r_t, best_p)
-        print("value compute complete")
-        # time-major (T+1, B, 1) / (T, B, 1) for the reverse scan + vmap.
-        v_tm = jnp.transpose(v_values, (1, 0, 2))      # (65, N, 1)
-        r_tm = jnp.transpose(rewards, (1, 0, 2))        # (64, N, 1)
-        td_lambda_return = self.calculate_td_lambda_return(
-            v_tm, r_tm, best_e
-        )  # (64, N, 1)
-        gae_tm = jnp.clip(td_lambda_return - v_tm[:-1], min=0)  # (64, N, 1)
-        gae_t = jnp.transpose(gae_tm, (1, 0, 2))         # (N, 64, 1)
-        print("GAE calculation complete")
+        organized_transitions = self.reorganize(
+            obs_t, la_t, act_t, dones_t, truncs_t, mo_r_t,
+            best_p, best_s, best_e, best_score, shuf_key, max_data_size,
+        ) # (n_used, ...)
 
-        return self.reorganize(
-            obs_t, la_t, act_t, ll_t, dones_t, truncs_t,
-            best_p, best_s, best_e, best_score, gae_t, shuf_key, max_data_size,
+        del obs_t, la_t
+
+        print("reorganized")
+        lambda_returns, gaes = self.compute_lambda_return_and_GAE(
+            self.critic_params,
+            self.moving_mean,
+            self.moving_std,
+            organized_transitions,
         )
+        mean_gae = jnp.mean(gaes)
+        gae_std = jnp.std(gaes)
+        # clipped_gaes = jnp.clip(gaes, 0.0, mean_gae + 3 * gae_std)
+
+        print("GAE compute complete")
+        print("average GAE:", mean_gae, "GAE std:", gae_std)
+        organized_transitions = organized_transitions.replace(
+            td_lambda_returns=lambda_returns,
+            gaes=gaes,
+            weights=jnp.ones_like(gaes),
+        )
+
+        return organized_transitions
 
 
 def relocate(
@@ -538,5 +510,25 @@ def relocate(
     return Relocator(
         critic_network, critic_params, moving_mean, moving_std, config
     ).relocate(transitions, final_info, key, max_data_size)
+
+
+
+def eval_return_and_GAE(
+    transitions: PPOTransition,
+    critic_network: nn.module,
+    critic_params,
+    moving_mean,
+    moving_std,
+    config: dict,
+    ):
+
+    return Relocator(
+            critic_network, critic_params, moving_mean, moving_std, config
+        ).compute_lambda_return_and_GAE(
+            critic_params,
+            moving_mean,
+            moving_std,
+            transitions,
+        )
 
 
