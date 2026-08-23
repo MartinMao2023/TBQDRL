@@ -11,7 +11,7 @@ from flax import serialization
 
 from typing import Tuple
 from custom_types import Params, RNGKey
-from networks import GC_PPO_Policy, GCMLP, GC_multi_Policy, GC_Selector
+from networks import PPO_Policy, GCMLP, Selector
 from task_wrappers.ant_mo_wrapper import AntMOWrapper
 from task_wrappers.humanoid_mo_wrapper import HumanoidMOWrapper
 from data_struct.states import GeneralizedState
@@ -43,15 +43,13 @@ env = HumanoidMOWrapper(env)
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
 selector_hidden_layers: Tuple[int, ...] = (128, 128)
 actor_hidden_layers: Tuple[int, ...] = (256, 256)
-policy_network = GC_PPO_Policy(
+policy_network = PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
-    initial_std=0.1 * jnp.ones(env.action_size),
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.silu,
     final_activation=jnp.tanh,
-    learnable_std=True,
 )
 
 critic_network = GCMLP(

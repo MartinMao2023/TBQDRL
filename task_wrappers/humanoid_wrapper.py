@@ -73,7 +73,7 @@ class HumanoidWrapper(BaseTaskWrapper):
         consistency_penalty = jnp.mean(jnp.square(action - state.z_state.z))
 
         transition_info = TransitionInfo(
-            reward=jnp.array([next_env_state.reward - consistency_penalty]), 
+            reward=jnp.array([next_env_state.reward * 0.5 - consistency_penalty]), 
             done=jnp.where(done > 0.5, jnp.ones(shape=(1,)), jnp.zeros(shape=(1,))),
             truncation=jnp.array([truncation]),
             broken=jnp.array([0.0]))

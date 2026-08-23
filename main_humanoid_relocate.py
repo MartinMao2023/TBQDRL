@@ -15,26 +15,28 @@ from networks import PPO_Policy, GCMLP, Multi_Action_PPO_Policy, Selector
 from task_wrappers.humanoid_mo_wrapper import HumanoidMOWrapper
 from tools import (
     build_on_policy_rollout,
-    with_policy_action_mean,
 )
 # from algorithms.relocation import relocate
 from algorithms.cem_relocation import relocate, eval_return_and_GAE
 from data_struct.states import GeneralizedState
 from data_struct import (
-    MORelocationTransition,
-    GMMDistillationTransition,
     PPOTransition,
 )
-
-from algorithms.combined_distill import CombinedDistill, CombinedDistillConfigs
 from algorithms.gmm_ppo import PPO, PPOConfigs
 from algorithms.critic_fine_tuning import CriticFineTuning, CriticFineTuningConfigs
+from algorithms.awr import (
+    AWR,
+    AWRConfigs,
+    AWRGMMPolicyConfigs,
+    AWRGMMPolicyExtractor,
+)
+
 
 
 # PPO configs
 vec_env = 4096
 mini_batch_size = 8192
-num_iterations = 1000
+num_iterations = 500
 policy_epochs = 4
 critic_epochs = 4
 policy_learning_rate_per_std = 2e-4  # unified (used for the GMM student distil lr)
@@ -49,10 +51,13 @@ relocation_config = {
 
 bc_mini_batch_size = 2048
 num_stage1_epochs = 32
-num_stage2_epochs = 8
+num_stage2_epochs = 4
 # data_size = 2097152
 data_size = 1572864
 
+expert_demo = True
+need_relocate = True
+need_distill = True
 
 env = envs.create(env_name="humanoid", episode_length=4096, backend="mjx", auto_reset=True, action_repeat=2)
 env = HumanoidMOWrapper(env)
@@ -80,7 +85,7 @@ loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 
 # folder_path = "output/MORL/test5"
-folder_path = "output/MORL/huamnoid_mo_corrected"
+folder_path = "output/MORL/huamnoid_150"
 # folder_path = "output/MORL/test"
 
 with open(folder_path + "/policy.msgpack", "rb") as f:
@@ -113,9 +118,7 @@ critic_tuning_state = critic_tuner.init(
 )
 
 loop_random_key, subkey = jax.random.split(loop_random_key)
-k1 = 0
-k2 = 4
-component_num = k1 + k2
+component_num = 4
 if component_num > 1:
     component_means = jnp.concatenate([
         jnp.zeros(env.action_size),
@@ -146,14 +149,12 @@ student_selection_network = Selector(
 )
 
 
-
 teacher_std_logits = policy_params["params"]["std_logits"]
 teacher_std = jax.nn.sigmoid(teacher_std_logits)
 
 
-expert_demo = False
 if expert_demo:
-    with open("output/MORL/test6/policy.msgpack", "rb") as f:
+    with open("output/MORL/humanoid_long/policy.msgpack", "rb") as f:
         encoded_bytes = f.read()
     expert_params = serialization.from_bytes(policy_template, encoded_bytes)
 else:
@@ -200,10 +201,6 @@ if num_collect_iterations > 0:
         collect_on_policy_data(states, loop_random_key)
     )
 
-need_distill = True
-
-
-
 
 if num_collect_iterations > 0:
     combined_transitions = on_policy_transitions
@@ -235,6 +232,7 @@ on_policy_PPO_transitions = PPOTransition(
 print("start tuning")
 loop_random_key, subkey = jax.random.split(loop_random_key)
 final_obs, final_last_actions = on_policy_final_info
+final_zs = jnp.concatenate([final_last_actions, on_policy_transitions.zs[:, -1, :, -5:]], axis=-1)
 critic_tuning_state, _ = critic_tuner.train(
     critic_tuning_state,
     on_policy_PPO_transitions,
@@ -244,7 +242,24 @@ critic_tuning_state, _ = critic_tuner.train(
     )
 print("tuning complete")
 
-need_relocate = True
+
+
+def to_traj(x):
+    x = jnp.swapaxes(x, -3, -2)  # (..., vec_env, rollout_length, d)
+    return x.reshape(-1, rollout_length, x.shape[-1])
+
+# flatten all
+on_policy_PPO_transitions = jax.tree.map(to_traj, on_policy_PPO_transitions)
+final_obs = final_obs.reshape(-1, final_obs.shape[-1])
+final_zs = final_zs.reshape(-1, final_zs.shape[-1])
+on_policy_PPO_transitions = critic_tuner.calculate_td_lambda_returns(
+    critic_tuning_state,
+    on_policy_PPO_transitions,
+    final_obs,
+    final_zs,
+)
+on_policy_PPO_transitions = jax.tree.map(lambda x: x.reshape(-1, x.shape[-1]), on_policy_PPO_transitions)
+
 
 if need_distill:
     print(combined_transitions.obs.shape)
@@ -263,6 +278,7 @@ if need_distill:
             max_data_size=data_size,
         )
 
+        del on_policy_transitions
         lambda_returns, gaes = eval_return_and_GAE(
             relocated_demonstrations,
             critic_network=critic_network,
@@ -271,19 +287,19 @@ if need_distill:
             moving_std=moving_std,
             config=relocation_config,
             )
+
         mean_gae = jnp.mean(gaes)
         gae_std = jnp.std(gaes)
-        clipped_gaes = jnp.clip(gaes, 0.0)
-
         print("New average GAEs:", mean_gae)
 
         relocated_demonstrations = relocated_demonstrations.replace(
             td_lambda_returns=lambda_returns,
-            gaes=gaes,
-            weights=jnp.clip(clipped_gaes / (jnp.mean(clipped_gaes) + 1e-6), max=10),
         )
-        
 
+        relocated_demonstrations = jax.tree.map(lambda x: x.reshape(-1, x.shape[-1]), relocated_demonstrations)
+        all_transitions = relocated_demonstrations
+
+        del relocated_demonstrations, on_policy_PPO_transitions
     else:
         dummy = jnp.ones_like(combined_transitions.td_lambda_returns) # distill teacher
 
@@ -305,86 +321,86 @@ if need_distill:
         # new_zs = jnp.concatenate([combined_transitions.zs[..., :-5], preferences], axis=-1)
 
 
-        relocated_demonstrations = PPOTransition(
-            obs=combined_transitions.obs,
-            actions=combined_transitions.actions,
-            zs=combined_transitions.zs,
-            # zs=new_zs,
-            log_likelihood=combined_transitions.log_likelihood,
-            rewards=dummy,
-            td_lambda_returns=dummy,
-            gaes=dummy,
-            dones=dummy,
-            truncations=dummy,
-            weights=dummy,
-        )
+        # relocated_demonstrations = PPOTransition(
+        #     obs=combined_transitions.obs,
+        #     actions=combined_transitions.actions,
+        #     zs=combined_transitions.zs,
+        #     # zs=new_zs,
+        #     log_likelihood=combined_transitions.log_likelihood,
+        #     rewards=dummy,
+        #     td_lambda_returns=dummy,
+        #     gaes=dummy,
+        #     dones=dummy,
+        #     truncations=dummy,
+        #     weights=dummy,
+        # )
+        # relocated_demonstrations = jax.tree.map(lambda x: x.reshape(-1, x.shape[-1]), relocated_demonstrations)
+        # all_transitions = relocated_demonstrations
+        # del relocated_demonstrations, on_policy_PPO_transitions
+
+        all_transitions = on_policy_PPO_transitions
+        del on_policy_PPO_transitions
 
 
-
-bc_configs = CombinedDistillConfigs(
-    action_learning_rate=3e-4,
-    selector_learning_rate=3e-4,
-    stage1_epochs=num_stage1_epochs,
-    stage2_epochs=num_stage2_epochs,
-    mini_batch_size=bc_mini_batch_size,
-    clip_log_ratio=0.2,
-    k1=k1,
-)
-bc = CombinedDistill(
-    env=env,
-    policy_network=student_action_network,
-    selector_network=student_selection_network,
-    teacher_std_logits=teacher_std_logits,
-    bc_configs=bc_configs,
-)
 
 if need_distill:
-    loop_random_key, subkey = jax.random.split(loop_random_key)
-    demo_flat = relocated_demonstrations.shuffle(subkey)            # (N_demo, ...)
-    distill_flat = distillation_transitions
-
-    # Both buffers must end up the same size so the per-epoch scan lines up.
-    _n = min(distill_flat.obs.shape[0], demo_flat.obs.shape[0])
-    _n = (_n // bc_mini_batch_size) * bc_mini_batch_size
-
-    def _batch(x):
-        return x[:_n].reshape(-1, bc_mini_batch_size, *x.shape[1:])
-
-    demo_batched = jax.tree.map(_batch, demo_flat)
-    distill_batched = jax.tree.map(_batch, distill_flat)
-
-    _distil_batch = distill_batched.obs.shape[:-1]
-    gmm_distillation_transitions = GMMDistillationTransition(
-        obs=distill_batched.obs,
-        zs=distill_batched.zs,
-        action_means=distill_batched.actions[..., None, :],  # (..., 1, d)
-        component_logits=jnp.zeros((*_distil_batch, 1)),     # (..., 1) -> softmax 1
+    awr_configs = AWRConfigs(
+        critic_learning_rate=critic_learning_rate,
+        critic_epochs=critic_epochs,
+        mini_batch_size=bc_mini_batch_size,
+    )
+    awr = AWR(
+        critic_network=critic_network,
+        configs=awr_configs,
+    )
+    awr_training_state = awr.init(
+        critic_params=critic_tuning_state.critic_params,
+        moving_mean=moving_mean,
+        moving_std=moving_std,
     )
 
     loop_random_key, subkey = jax.random.split(loop_random_key)
-    bc_training_state = bc.init(subkey)
-
-    print(
-        f"Combined distill: {_n} samples | "
-        f"{_n // bc_mini_batch_size} mini-batches x {bc_mini_batch_size} | "
-        f"stage1 {num_stage1_epochs} epochs + stage2 {num_stage2_epochs} epochs"
-    )
-
-    bc_training_state, _metrics = bc.distill(
-        bc_training_state,
-        (gmm_distillation_transitions, demo_batched),
+    (awr_training_state, all_transitions), awr_metrics = awr.train(
+        awr_training_state,
+        all_transitions,
         subkey,
     )
+    critic_params = awr_training_state.critic_params
 
-    print(_metrics.bc_loss)
+    awr_policy_configs = AWRGMMPolicyConfigs(
+        policy_learning_rate=3e-4,
+        selector_learning_rate=selector_learning_rate,
+        policy_epochs=num_stage1_epochs,
+        stage2_epochs=num_stage2_epochs,
+        mini_batch_size=bc_mini_batch_size,
+        temperature=7.5,
+    )
+    awr_policy_extractor = AWRGMMPolicyExtractor(
+        env=env,
+        policy_network=student_action_network,
+        selector_network=student_selection_network,
+        configs=awr_policy_configs,
+    )
 
-    del distillation_transitions, demo_flat, relocated_demonstrations 
-    del gmm_distillation_transitions, demo_batched
+    loop_random_key, subkey = jax.random.split(loop_random_key)
+    awr_policy_training_state = awr_policy_extractor.init(subkey)
+    awr_policy_training_state, awr_policy_metrics = (
+        awr_policy_extractor.train(
+            awr_policy_training_state,
+            all_transitions,
+            target_std_logits=teacher_std_logits,
+        )
+    )
 
-    # Relocated-only distilled student policy (std fixed to teacher by distill).
-    relocated_only_policy_params = bc_training_state.policy_params
+    print("AWR critic RMSE:", awr_metrics.critic_rmse)
+    print(
+        "AWR stage 1/2 loss:",
+        awr_policy_metrics.stage1_loss,
+        awr_policy_metrics.stage2_loss,
+    )
 
-# """
+    extracted_policy_params = awr_policy_training_state.policy_params
+    extracted_selector_params = awr_policy_training_state.selector_params
 
 
 group_name = "relocation humanoid"
@@ -403,9 +419,6 @@ wandb_config = {
     "ppo_rollout_length": ppo_rollout_length,
     "use_dropout_rollout": False,
 }
-
-
-print(f"k1: {k1}, component num: {component_num}")
 
 ppo_config = PPOConfigs(
     policy_learning_rate_per_std=policy_learning_rate_per_std,
@@ -426,8 +439,8 @@ ppo_config = PPOConfigs(
 if need_distill:
     used_action_network = student_action_network
     used_selector_network = student_selection_network
-    used_action_params = relocated_only_policy_params
-    used_selector_params = bc_training_state.selector_params
+    used_action_params = extracted_policy_params
+    used_selector_params = extracted_selector_params
 else:
     used_action_network = policy_network
     used_selector_network = None
@@ -453,12 +466,9 @@ selector_training_state = selector_training_state.replace(
     moving_mean=moving_mean,
     moving_squared_diff=jnp.square(moving_std),
     iteration_num=5000,
-    moving_mse=300,
+    moving_mse=moving_mse,
 )
 
-# fresh key for the selector PPO phase (matches main_ant_GMM.py convention)
-# seed = 8848
-# loop_random_key = jax.random.PRNGKey(seed)
 carry = (states, selector_training_state, loop_random_key, 0)
 
 wandb.init(
@@ -491,7 +501,6 @@ def training_loop(carry, _):
     return new_carry, aux_data
     
 
-
 log_period = 10
 for i in range(int(num_iterations // log_period)):
     carry,  stacked_aux_data = jax.lax.scan(training_loop, carry, length=log_period)
@@ -500,10 +509,9 @@ for i in range(int(num_iterations // log_period)):
         "critic_RMSE": jnp.mean(stacked_aux_data.critic_rmse),
         "approx_kl": jnp.mean(stacked_aux_data.policy_approx_kl),
         "gated_return": jnp.mean(stacked_aux_data.average_return),
+        "selection entropy": jnp.mean(stacked_aux_data.selection_entropy),
     })
     print("return", jnp.mean(stacked_aux_data.average_return))
 
 wandb.finish()
 
-
-# """

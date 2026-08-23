@@ -21,7 +21,6 @@ from algorithms.cem_relocation import relocate, eval_return_and_GAE
 from data_struct.states import GeneralizedState
 from data_struct import (
     MORelocationTransition,
-    GMMDistillationTransition,
     PPOTransition,
 )
 from algorithms.gmm_ppo import PPO, PPOConfigs
@@ -51,9 +50,9 @@ num_collect_iterations = 16 # <----------------    change to 8
 relocation_config = {}
 
 
-expert_demo = False
+expert_demo = True
 need_distill = True
-need_relocate = True
+need_relocate = False
 
 bc_mini_batch_size = 2048
 
@@ -394,12 +393,12 @@ if need_distill:
     critic_params = awr_training_state.critic_params
 
     awr_policy_configs = AWRGMMPolicyConfigs(
-        policy_learning_rate=policy_learning_rate_per_std,
+        policy_learning_rate=3e-4,
         selector_learning_rate=selector_learning_rate,
         policy_epochs=num_stage1_epochs,
         stage2_epochs=num_stage2_epochs,
         mini_batch_size=bc_mini_batch_size,
-        temperature=7.5,
+        temperature=15,
     )
     awr_policy_extractor = AWRGMMPolicyExtractor(
         env=env,
@@ -430,10 +429,8 @@ if need_distill:
 
 
 
-if expert_demo:
-    group_name = "200 learn from 300"
-else:
-    group_name = "relocation combined"
+
+group_name = "relocation combined"
 
 wandb_config = {
     "task": "relocation ablation: relocated-only distil + selector",
