@@ -21,7 +21,7 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 16384
-num_iterations = 4000
+num_iterations = 2000
 policy_epochs = 4
 critic_epochs = 4
 fitness_critic_epochs = 4
@@ -67,7 +67,7 @@ ppo_config = PPOConfigs(
     clip_ratio=0.2,
     entropy_gain=0.001,
     discount=0.99,
-    gae_lambda=1.0,
+    gae_lambda=0.95,
     rollout_length=rollout_length,
     vec_env=vec_env,
     mini_batch_size=mini_batch_size,
@@ -81,7 +81,7 @@ loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", reset_noise_scale=0.0)
-env = AntFiniteMaternWrapper(env) # for horizon = 4.8 seconds
+env = AntFiniteMaternWrapper(env, max_radius=2) # for horizon = 4.8 seconds
 
 
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
@@ -174,10 +174,11 @@ for i in range(int(num_iterations / log_period)):
         "iteration mean return": jnp.mean(stacked_aux_data.average_return), 
         "iteration mean reward": jnp.mean(stacked_aux_data.average_reward),
         "dones per episode": jnp.mean(stacked_aux_data.done_count) / vec_env,
-        "gae mean": jnp.mean(stacked_aux_data.gae_mean),
+        # "gae mean": jnp.mean(stacked_aux_data.gae_mean),
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
-
+    
+    carry = (initial_states, ppo_training_state, loop_random_key)
 
 # (
 #     _, 
