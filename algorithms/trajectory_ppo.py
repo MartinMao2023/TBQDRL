@@ -408,7 +408,8 @@ class PPO:
             )
 
             predictions = jnp.clip((nn.sigmoid(v_logits) * 64 - 32) / 31, zero, one)
-            squared_errors = jnp.square(predictions - mini_batch.target_values)
+            targets = (mini_batch.target_values * 64 - 32) / 31
+            squared_errors = jnp.square(predictions - targets)
             mse_loss = jnp.average(squared_errors, weights=mini_batch.weights)
             return bce_loss, jnp.sqrt(mse_loss)
 

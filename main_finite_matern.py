@@ -172,6 +172,8 @@ for i in range(int(num_iterations / log_period)):
         "critic_RMSE": jnp.mean(stacked_aux_data.critic_rmse),
         "approx_kl": jnp.mean(stacked_aux_data.policy_approx_kl),
         "iteration mean return": jnp.mean(stacked_aux_data.average_return), 
+        "iteration mean reward": jnp.mean(stacked_aux_data.average_reward),
+        "dones per episode": jnp.mean(stacked_aux_data.done_count) / vec_env,
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
 
