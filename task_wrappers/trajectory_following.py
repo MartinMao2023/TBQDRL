@@ -193,7 +193,7 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
 
         new_task_state = MaternTaskState(
             position_offset=-state_info.position,
-            last_action=jnp.zeros_like(self.action_size),
+            last_action=jnp.zeros((self.action_size,)),
             reshaped_sequence=reshaped_sequence,
             padding_element=padding_element,
             steps_taken=jnp.int32(0),

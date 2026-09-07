@@ -234,7 +234,7 @@ class PPO:
             return (states, sampled_states, ls, keys), rollout_data # (steps_per_way_point, vec_env, d)
 
         final_carry, rollout_data = jax.lax.scan(
-            lambda x, _: step_way_point(x),
+            lambda x, y: step_way_point(x, y),
             (states, states, jnp.zeros((self.configs.vec_env,)), keys),
             length=self._env.way_points,
         )
