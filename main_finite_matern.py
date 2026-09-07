@@ -67,7 +67,7 @@ ppo_config = PPOConfigs(
     clip_ratio=0.2,
     entropy_gain=0.001,
     discount=0.99,
-    gae_lambda=0.95,
+    gae_lambda=1.0,
     rollout_length=rollout_length,
     vec_env=vec_env,
     mini_batch_size=mini_batch_size,
@@ -174,6 +174,7 @@ for i in range(int(num_iterations / log_period)):
         "iteration mean return": jnp.mean(stacked_aux_data.average_return), 
         "iteration mean reward": jnp.mean(stacked_aux_data.average_reward),
         "dones per episode": jnp.mean(stacked_aux_data.done_count) / vec_env,
+        "gae mean": jnp.mean(stacked_aux_data.gae_mean),
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
 
