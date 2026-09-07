@@ -462,7 +462,7 @@ class PPO:
         raw_gaes = critic_targets - v_values
 
         iteration_num = training_state.iteration_num + 1
-        average_return = jnp.mean(critic_targets)
+        average_return = jnp.mean(critic_targets[0])
         statistics_learning_rate = one / iteration_num
         mse_learning_rate = jnp.maximum(statistics_learning_rate, 0.05)
 

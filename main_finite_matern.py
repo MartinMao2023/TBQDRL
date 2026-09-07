@@ -81,7 +81,7 @@ loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", reset_noise_scale=0.0)
-env = AntFiniteMaternWrapper(env, max_radius=2) # for horizon = 4.8 seconds
+env = AntFiniteMaternWrapper(env, inner_radius=1.0, max_radius=2) # for horizon = 4.8 seconds
 
 
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
