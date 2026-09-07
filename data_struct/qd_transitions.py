@@ -21,6 +21,7 @@ class QDTransitionInfo(flax.struct.PyTreeNode):
     reward: Reward
     fitness_reward: Reward
     done: Done
+    completion: jax.Array
     truncation: jax.Array  # Indicates if an episode has reached max time step
     broken: jax.Array # Indicates if the simulation diverged
 

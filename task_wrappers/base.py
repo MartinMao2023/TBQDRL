@@ -86,12 +86,32 @@ class BaseTaskWrapper(Wrapper, abc.ABC):
 
 class BaseQDTaskWrapper(BaseTaskWrapper, abc.ABC):
 
+    def __init__(self, env: Env, way_points: int, steps_per_way_point: int, dt: float):
+        super().__init__(env)
+        self.way_points = way_points
+        self.steps_per_way_point = steps_per_way_point
+        self.dt = dt
+
+        self.max_step_num = int(way_points * steps_per_way_point)
+        self.horizon = way_points * steps_per_way_point * dt
+        self.period_t = steps_per_way_point * dt
+
+
     @abc.abstractmethod
     def step(
         self, 
         state: GeneralizedState, 
         action: jax.Array,
-        inv_r: jax.Array = 1.0, # inverse of radius (array)
     ) -> Tuple[GeneralizedState, QDTransitionInfo]:
         """return next state, and transition information"""
+        pass
+
+
+    @abc.abstractmethod
+    def shift(self, state: GeneralizedState) -> GeneralizedState:
+        """
+        To shift:
+            1) take cycle_t - self.period_t
+            2) shift and pad reshaped_sequence
+        """
         pass

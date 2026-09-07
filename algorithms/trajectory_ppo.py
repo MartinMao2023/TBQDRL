@@ -7,9 +7,10 @@ import optax
 from flax.struct import PyTreeNode, dataclass
 from jax import numpy as jnp
 
+from optax.losses import sigmoid_binary_cross_entropy
 from custom_types import Params, RNGKey
 from data_struct.states import GeneralizedState
-from task_wrappers.base import BaseTaskWrapper
+from task_wrappers.base import BaseQDTaskWrapper
 
 
 zero = jnp.float32(0.0)
@@ -23,7 +24,7 @@ class PPOConfigs:
     clip_ratio: float = 0.2
     approx_kl_threshold: float = 0.0125
     entropy_gain: float = 0.01
-    discount: float = 0.99
+    discount: float = 0.99 # not used if no fitness
     gae_lambda: float = 0.95
     rollout_length: int = 64
     vec_env: int = 256
@@ -41,6 +42,7 @@ class PPORollout(PyTreeNode):
     old_log_probs: jax.Array
     rewards: jax.Array
     dones: jax.Array
+    completion: jax.Array
     truncations: jax.Array
 
 
@@ -62,8 +64,6 @@ class PPOTrainingState(PyTreeNode):
     policy_opt_state: optax.OptState
     critic_opt_state: optax.OptState
     iteration_num: jax.Array
-    moving_mean: jax.Array
-    moving_squared_diff: jax.Array
     moving_mse: jax.Array
     lr_scale: jax.Array
 
@@ -81,7 +81,7 @@ class PPOMetrics(PyTreeNode):
 class PPO:
     def __init__(
         self,
-        env: BaseTaskWrapper,
+        env: BaseQDTaskWrapper,
         policy_network: nn.Module,
         critic_network: nn.Module,
         ppo_configs: PPOConfigs,
@@ -90,6 +90,7 @@ class PPO:
         self._policy_network = policy_network
         self._critic_network = critic_network
         self.configs = ppo_configs
+        self.reward_scale = 1 / env.max_step_num
 
         # Calculating configs
         self.samples_per_rollout = ppo_configs.vec_env * ppo_configs.rollout_length
@@ -161,8 +162,6 @@ class PPO:
             policy_opt_state=policy_opt_state,
             critic_opt_state=self._critic_optimizer.init(critic_params),
             iteration_num=jnp.asarray(0, dtype=jnp.int32),
-            moving_mean=zero,
-            moving_squared_diff=one,
             moving_mse=zero,
             lr_scale=one,
         )
@@ -220,14 +219,29 @@ class PPO:
                 old_log_probs=log_probability,
                 rewards=transition_info.reward,
                 dones=transition_info.done,
+                completion=transition_info.completion,
                 truncations=transition_info.truncation,
             )
             return (next_state, sampled_state, episode_length, key), transition
 
-        final_carry, rollout_data = jax.lax.scan(
+        def step_way_point(carry, _):
+            carry, rollout_data = jax.lax.scan(
             lambda x, _: jax.vmap(play_env_step)(x),
+            carry,
+            length=self._env.steps_per_way_point)
+            (states, sampled_states, ls, keys) = carry
+            states = jax.vmap(self._env.shift)(states)
+            return (states, sampled_states, ls, keys), rollout_data # (steps_per_way_point, vec_env, d)
+
+        final_carry, rollout_data = jax.lax.scan(
+            lambda x, _: step_way_point(x),
             (states, states, jnp.zeros((self.configs.vec_env,)), keys),
-            length=self.configs.rollout_length,
+            length=self._env.way_points,
+        )
+
+        rollout_data = jax.tree.map(
+            lambda x: jnp.reshape(x, (-1,) + x.shape[2:]),
+            rollout_data,
         )
         final_states, sampled_states = final_carry[:2]
         return final_states, sampled_states, rollout_data
@@ -239,9 +253,9 @@ class PPO:
         obs: jax.Array,
         zs: jax.Array,
     ) -> jax.Array:
-        moving_std = jnp.sqrt(training_state.moving_squared_diff)
-        v_values = self._critic_network.apply(training_state.critic_params, obs, zs)
-        return v_values * moving_std + training_state.moving_mean
+        v_logits = self._critic_network.apply(training_state.critic_params, obs, zs)
+        v_values = (nn.sigmoid(v_logits) * 64 - 32) / 31
+        return jnp.clip(v_values, zero, one)
 
 
     def calculate_td_lambda_returns(
@@ -249,16 +263,19 @@ class PPO:
         all_v_values: jax.Array,
         rollout_data: PPORollout,
     ) -> Tuple[jax.Array, jax.Array]:
-        
-        actual_discount = jnp.where(rollout_data.dones > 0.5, zero, self.configs.discount) # (rollout, vec_env, 1)
-        ks = self.configs.gae_lambda * actual_discount # (rollout, vec_env, 1)
-        bs = actual_discount * ((1 - self.configs.gae_lambda) * all_v_values[1:, ...]) # (rollout, vec_env, 1)
+        cond = rollout_data.dones + rollout_data.completion > 0.5
+        ks = jnp.where(cond, zero, self.configs.gae_lambda) # (rollout, vec_env, 1)
+        bs = jnp.where(
+            cond, 
+            zero, 
+            (1 - self.configs.gae_lambda) * all_v_values[1:, ...],
+            ) + rollout_data.rewards * self.reward_scale # (rollout, vec_env, 1)
         init_target = all_v_values[-1] # (vec_env, 1)
 
         def scan_calculate_td_lambda(carry, data):
             last_target, last_bootstrap_portion = carry
-            reward, truncation, k, b, v_value = data
-            target = jnp.where(truncation > 0.5, v_value, reward + k * last_target + b)
+            truncation, k, b, v_value = data
+            target = jnp.where(truncation > 0.5, v_value, k * last_target + b)
             bootstrap_portion = jnp.where(truncation > 0.5, one, last_bootstrap_portion * k)
             new_carry = (target, bootstrap_portion)
             return new_carry, new_carry
@@ -266,7 +283,7 @@ class PPO:
         _, (critic_targets, bootstrap_portions) = jax.lax.scan(
             jax.vmap(scan_calculate_td_lambda),
             (init_target, jnp.ones_like(init_target)),
-            (rollout_data.rewards, rollout_data.truncations, ks, bs, all_v_values[:-1]),
+            (rollout_data.truncations, ks, bs, all_v_values[:-1]),
             reverse=True,
         )
         critic_target_weights = one / (one + jnp.square(bootstrap_portions))
@@ -380,14 +397,20 @@ class PPO:
         training_data: TrainingData,
     ) -> Tuple[Params, optax.OptState, jax.Array]:
         def loss_fn(params: Params, mini_batch: TrainingData):
-            predictions = self._critic_network.apply(
+            v_logits = self._critic_network.apply(
                 params,
                 mini_batch.obs,
                 mini_batch.zs,
             )
+            bce_loss = jnp.average(
+                sigmoid_binary_cross_entropy(v_logits, mini_batch.target_values), 
+                weights=mini_batch.weights,
+            )
+
+            predictions = jnp.clip((nn.sigmoid(v_logits) * 64 - 32) / 31, zero, one)
             squared_errors = jnp.square(predictions - mini_batch.target_values)
-            loss = jnp.average(squared_errors, weights=mini_batch.weights)
-            return loss, jnp.sqrt(loss)
+            mse_loss = jnp.average(squared_errors, weights=mini_batch.weights)
+            return bce_loss, jnp.sqrt(mse_loss)
 
         def update_minibatch(carry, mini_batch):
             params, opt_state, running_rmse = carry
@@ -441,16 +464,7 @@ class PPO:
         average_return = jnp.mean(critic_targets)
         statistics_learning_rate = one / iteration_num
         mse_learning_rate = jnp.maximum(statistics_learning_rate, 0.05)
-        moving_mean = (
-            (one - statistics_learning_rate) * training_state.moving_mean
-            + statistics_learning_rate * average_return
-        )
-        moving_squared_diff = jnp.maximum(
-            (one - statistics_learning_rate) * training_state.moving_squared_diff
-            + statistics_learning_rate * jnp.mean(jnp.square(critic_targets - moving_mean)),
-            one,
-        )
-        moving_std = jnp.sqrt(moving_squared_diff)
+
         moving_mse = (
             (one - mse_learning_rate) * training_state.moving_mse
             + mse_learning_rate * jnp.mean(jnp.square(raw_gaes))
@@ -462,9 +476,7 @@ class PPO:
             v_values - 3.0 * jnp.sqrt(moving_mse),
             v_values + 3.0 * jnp.sqrt(moving_mse),
         )
-        normalized_critic_targets = (
-            clipped_critic_targets - moving_mean
-        ) / moving_std
+        normalized_critic_targets = clipped_critic_targets / 64 * 31 + 0.5
 
         shuffled_indices = self._make_shuffle_indices(shuffle_key)
         training_data = self._shuffle_data(
@@ -507,13 +519,11 @@ class PPO:
             policy_opt_state=policy_opt_state,
             critic_opt_state=critic_opt_state,
             iteration_num=iteration_num,
-            moving_mean=moving_mean,
-            moving_squared_diff=moving_squared_diff,
             moving_mse=moving_mse,
             lr_scale=lr_scale,
         )
         metrics = PPOMetrics(
-            critic_rmse=critic_rmse * moving_std,
+            critic_rmse=critic_rmse,
             policy_approx_kl=policy_approx_kl,
             average_reward=jnp.mean(rollout_data.rewards),
             average_return=average_return,
