@@ -19,6 +19,13 @@ class GeneralizedState:
     initial_state_info: struct.PyTreeNode # used to resample initial_z_state
     initial_z_state: TaskState # used in autoreset
     key: jax.Array
-    
+
+
+@struct.dataclass
+class GeneralizedQDState:
+    env_state: BraxState
+    z_state: TaskState
+    initial_z_state: TaskState # used in autoreset
+    key: jax.Array
 
 

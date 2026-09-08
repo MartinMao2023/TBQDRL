@@ -8,7 +8,7 @@ import numpy.linalg as lg
 from flax.struct import PyTreeNode
 from brax.envs.base import State
 from brax.envs.base import Env, PipelineEnv
-from task_wrappers.base import BaseTaskWrapper, BaseQDTaskWrapper
+from task_wrappers.base import BaseQDTaskWrapper
 # from data_struct.states import GeneralizedState
 # from data_struct.transitions import TransitionInfo
 from data_struct.qd_transitions import QDTransitionInfo
@@ -30,18 +30,9 @@ class MaternTaskState(PyTreeNode):
     # z in the form [ys_x, ys_y, vs_x, vs_y, sin(cycle_t), cos(cycle_t), 2 * task_t - 1]
 
 
-
-
-class State_info(PyTreeNode):
-    position: jax.Array # (2,) for unbounded
-    obs: jax.Array # (obs_dim,)
-
-
-
 class GeneralizedState(PyTreeNode):
     env_state: State
     z_state: MaternTaskState
-    initial_state_info: State_info # used to resample initial_z_state
     initial_z_state: MaternTaskState # used in reset
     key: jax.Array
 
@@ -55,6 +46,7 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         steps_per_way_point: int = 8,
         var: float = 2.25,
         l: float = 1,
+        tolerance_radius: float = 0.0,
         inner_radius: float = 0.5,
         outer_radius: float = 1.5,
         max_radius: float = 3.0,
@@ -71,6 +63,7 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         self.inv_period_t = 1 / period_t
         self.omega = jnp.pi * 2 / period_t
 
+        self.tolerance_radius = tolerance_radius
         self.max_square_dist = max_radius**2
         self.inner_scale = 1 / inner_radius**2
         self.outer_scale = 1 / outer_radius**2
@@ -132,42 +125,18 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         # jnp.sum(((2, 4) @ self.Sigma22_inv_AT) * base_fn, axis=-1) # shape of (2,)
 
 
-
     @property
     def z_size(self):
         return self.z_dim
-
-
-    @property
-    def observation_size(self) -> int:
-        return 27 # last action is excluded for now
-    
-
-    @property
-    def has_z(self):
-        return True
     
 
     def _get_position_from_envstate(self, env_state: State) -> jax.Array:
         """Change this line if doesn't work for other agent"""
 
         return env_state.pipeline_state.x.pos[0, :2] # (2,)
-    
 
-    def _extract_state_info_for_task(self, env_state: State) -> State_info:
-        state_info = State_info(
-            position=self._get_position_from_envstate(env_state),
-            obs=env_state.obs,
-            )
-        return state_info
-    
 
-    def _init_task_state(self, state_info: State_info, key: jax.Array) -> PyTreeNode:
-        """initialize task state"""
-
-        # sample way_points data
-        means = self.posterior_mu_T * state_info.obs[13:15, None] # (2, 2 * waypoints + 1)
-        sampled_sequence = means + jax.random.normal(key, (2, 2 * self.way_points + 1)) @ self.posterior_L.T # (2, 2 * way_points + 1)
+    def _organize_z_state(self, sampled_sequence: jax.Array, position_offset: jax.Array) -> MaternTaskState:
 
         task_sequence = jnp.concatenate(
             [jnp.zeros((2, 1)), sampled_sequence, sampled_sequence[:, -2:-1], jnp.zeros((2, 1))],
@@ -191,8 +160,8 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
             axis=-1,
         )
 
-        new_task_state = MaternTaskState(
-            position_offset=-state_info.position,
+        task_state = MaternTaskState(
+            position_offset=position_offset,
             last_action=jnp.zeros((self.action_size,)),
             reshaped_sequence=reshaped_sequence,
             padding_element=padding_element,
@@ -201,7 +170,19 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
             z=z,
         )
 
-        return new_task_state
+        return task_state
+    
+
+    def sample_task(self, env_state: State, key: jax.Array) -> MaternTaskState:
+        """initialize task state"""
+
+        # sample way_points data
+        means = self.posterior_mu_T * env_state.obs[13:15, None] # (2, 2 * waypoints + 1)
+        sampled_sequence = means + jax.random.normal(key, (2, 2 * self.way_points + 1)) @ self.posterior_L.T # (2, 2 * way_points + 1)
+        position_offset=-self._get_position_from_envstate(env_state)
+        task_state = self._organize_z_state(sampled_sequence, position_offset)
+
+        return task_state
 
 
     def get_obs(self, state: GeneralizedState) -> Tuple[jax.Array, Tuple[jax.Array, ...]]:
@@ -260,7 +241,11 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         deviation = target_position - current_position # (2,)
 
         # calculate reward
-        squared_distance = jnp.sum(jnp.square(deviation))
+        l2_dist = jnp.maximum(
+            jnp.sqrt(jnp.sum(jnp.square(deviation))) - self.tolerance_radius, 
+            0.0,
+            )
+        squared_distance = jnp.square(l2_dist)
         fail = squared_distance > self.max_square_dist
         reward = 0.5 * (
             jnp.exp(-squared_distance * self.inner_scale) + 
@@ -330,4 +315,59 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
 
         return state.replace(z_state=next_task_state)
     
+
+
+
+class AntLineMaternWrapper(AntFiniteMaternWrapper):
+
+
+    def sample_task(self, env_state, key):
+        # sample way_points data
+
+        key1, key2 = jax.random.split(key)
+        angle = jax.random.uniform(key1, minval=0.0, maxval=2*jnp.pi)
+        speed = jax.random.uniform(key2, 1.5, 3.0)
+        target_velocity = jnp.array([
+            jnp.cos(angle) * speed,
+            jnp.sin(angle) * speed,
+        ]) # (2,)
+
+        current_velocity = env_state.obs[13:15]
+
+
+        def scan_track(carry, _):
+            pos, vel = carry
+            dv = target_velocity - vel
+            dv_norm = jnp.sqrt(jnp.sum(dv**2))
+            acc = dv / (1e-6 + dv_norm) * 0.8
+
+            acc_t = jnp.minimum(self.period_t, dv_norm * 1.25)
+            rest_t = self.period_t - acc_t
+            d_pos = vel * acc_t + 0.5 * acc * acc_t**2 + target_velocity * rest_t
+
+            new_pos = pos + d_pos
+            new_vel = vel + acc * acc_t
+
+            return (new_pos, new_vel), jnp.concatenate([new_pos, new_vel]) # (pos_x, pos_y, vel_x, vel_y)
+
+
+        _, sampled_sequence = jax.lax.scan(
+            scan_track,
+            (jnp.zeros((2,)), current_velocity),
+            length=self.way_points,
+        )
+        sampled_sequence = jnp.reshape(
+            jnp.concatenate([
+                current_velocity, 
+                jnp.reshape(sampled_sequence, (-1)),
+                ]),
+            (-1, 2),
+        ).T # (2, 2 * way_points + 1)
+
+        position_offset=-self._get_position_from_envstate(env_state)
+        task_state = self._organize_z_state(sampled_sequence, position_offset)
+
+        return task_state
+
+
 

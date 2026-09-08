@@ -15,7 +15,7 @@ from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
 from networks import GCMLP, PPO_Policy
 # from functools import partial
 from flax import serialization
-from task_wrappers.trajectory_following import AntFiniteMaternWrapper
+from task_wrappers.trajectory_following import AntLineMaternWrapper
 from data_struct.states import GeneralizedState
 
 
@@ -81,7 +81,7 @@ loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", reset_noise_scale=0.0)
-env = AntFiniteMaternWrapper(env, inner_radius=1.0, max_radius=2) # for horizon = 4.8 seconds
+env = AntLineMaternWrapper(env, inner_radius=1.0, max_radius=2, tolerance_radius=0.2) # for horizon = 4.8 seconds
 
 
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
