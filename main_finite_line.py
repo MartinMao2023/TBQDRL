@@ -21,7 +21,7 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 16384
-num_iterations = 4000
+num_iterations = 2000
 policy_epochs = 4
 critic_epochs = 4
 fitness_critic_epochs = 4
