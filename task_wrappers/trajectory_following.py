@@ -326,7 +326,7 @@ class AntLineMaternWrapper(AntFiniteMaternWrapper):
 
         key1, key2 = jax.random.split(key)
         angle = jax.random.uniform(key1, minval=0.0, maxval=2*jnp.pi)
-        speed = jax.random.uniform(key2, 1.5, 3.0)
+        speed = jax.random.uniform(key2, minval=1.5, maxval=3.0)
         target_velocity = jnp.array([
             jnp.cos(angle) * speed,
             jnp.sin(angle) * speed,
