@@ -136,9 +136,10 @@ def training_loop(
         loop_random_key,
     )
     vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
+    states = jax.vmap(env.resample_task_state)(initial_states)
     
     new_carry = (
-        initial_states,
+        states,
         ppo_training_state,
         loop_random_key,
     )
@@ -178,7 +179,7 @@ for i in range(int(num_iterations / log_period)):
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
     
-    carry = (initial_states, ppo_training_state, loop_random_key)
+    carry = (states, ppo_training_state, loop_random_key)
 
 # (
 #     _, 
