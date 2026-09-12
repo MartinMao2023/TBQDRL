@@ -27,7 +27,7 @@ class MaternTaskState(PyTreeNode):
     steps_taken: jax.Array
     cycle_t: float # absolute time within a period
     z: jnp.ndarray # (-1,)
-    # z in the form [ys_x, ys_y, vs_x, vs_y, sin(cycle_t), cos(cycle_t), 2 * task_t - 1]
+    # z: [s1_x, v1_x, s2_x, v2_x, ..., s1_y, v1_y, s2_y, s2_y, ..., sin(cycle_t), cos(cycle_t), 2 * task_t - 1]
 
 
 class GeneralizedState(PyTreeNode):
@@ -151,10 +151,11 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         ys = task_sequence[:, :-1, 0] # (2, way_points + 1)
         ys = jnp.diff(ys, axis=1, prepend=0) * self.inv_period_t # special step for x-y position
         vs = task_sequence[:, :-1, 1] # (2, way_points + 1)
+        presented_task_sequence = jnp.concatenate([ys[..., None], vs[..., None]], axis=-1) # (2, way_points + 1, 2)
+
         z = jnp.concatenate(
             [
-                jnp.reshape(ys, (-1,)),
-                jnp.reshape(vs, (-1,)),
+                jnp.reshape(presented_task_sequence, (-1,)),
                 jnp.array([0.0, 1.0, -1.0]),
             ],
             axis=-1,
@@ -259,13 +260,14 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
             0.0,
             )
         corrected_deviation = target_position - current_position - compensation # (2,)
+        normalized_ys = jnp.diff(shifted_ys - corrected_deviation[:, None], axis=-1, prepend=0) * self.inv_period_t
+        presented_task_sequence = jnp.concatenate([
+            normalized_ys[..., None], 
+            shifted_vs[..., None],
+            ], axis=-1) # (2, way_points + 1, 2)
 
         z = jnp.concatenate([
-            jnp.reshape(
-                jnp.diff(shifted_ys - corrected_deviation[:, None], axis=-1, prepend=0), 
-                (-1,),
-            ) * self.inv_period_t, # special step for x-y position
-            jnp.reshape(shifted_vs, (-1,)),
+            jnp.reshape(presented_task_sequence, (-1,)),
             jnp.array([
                 jnp.sin(self.omega * z_cycle_t), 
                 jnp.cos(self.omega * z_cycle_t), 

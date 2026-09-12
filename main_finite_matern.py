@@ -49,8 +49,8 @@ description_text = "\n".join(
     [f"{i}: {j}" for i, j in description.items()]
 )
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-folder_path = f"./output/matern/output_{timestamp}"
+
+folder_path = f"./output/matern/saved_data"
 
 if not os.path.exists(folder_path):
     os.makedirs(folder_path, exist_ok=True)
@@ -181,23 +181,20 @@ for i in range(int(num_iterations / log_period)):
     
     carry = (states, ppo_training_state, loop_random_key)
 
-# (
-#     _, 
-#     final_ppo_training_state, 
-#     loop_random_key,
-# ) = carry
+(
+    _, 
+    final_ppo_training_state, 
+    loop_random_key,
+) = carry
 
-# model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
-# critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
+model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
+critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
 
-# with open(folder_path + f"/model_{structure}.msgpack", "wb") as f:
-#     f.write(model_bytes)
+with open(folder_path + f"/policy.msgpack", "wb") as f:
+    f.write(model_bytes)
 
-# with open(folder_path + f"/critic_{structure}.msgpack", "wb") as f:
-#     f.write(critic_bytes)
-
-# with open(folder_path + f"/fitness_critic_{structure}.msgpack", "wb") as f:
-#     f.write(fitness_critic_bytes)
+with open(folder_path + f"/critic.msgpack", "wb") as f:
+    f.write(critic_bytes)
 
 wandb.finish()
 
