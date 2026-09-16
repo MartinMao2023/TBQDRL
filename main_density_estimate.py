@@ -30,7 +30,7 @@ DENSITY_PATH = Path("density_estimate_512x512.npy")
 
 SEED = 0
 NUM_STEPS = 10_000
-BATCH_SIZE = 4_096
+BATCH_SIZE = 8192
 LEARNING_RATE = 3e-4
 MAX_GRADIENT_NORM = 5.0
 REPORT_EVERY = 100
@@ -47,8 +47,8 @@ FLOW_CONFIG = FlowConfig(
     dimension=2,
     num_layers=8,
     hidden_features=(128, 128),
-    num_bins=8,
-    tail_bound=3.0,
+    num_bins=32,
+    tail_bound=4.0,
 )
 
 description = {
@@ -365,7 +365,9 @@ def main() -> None:
         save_result(state, tuple(image.shape))
         density = evaluate_density_grid(flow, state.params)
         np.save(DENSITY_PATH, density, allow_pickle=False)
-        display_density = density / np.maximum(density.max(), np.finfo(density.dtype).tiny)
+        
+        display_density = density / np.maximum(np.percentile(density, 99), np.finfo(density.dtype).tiny)
+        display_density = np.minimum(display_density, 1.0)
         run.log(
             {
                 "density_estimate": wandb.Image(
