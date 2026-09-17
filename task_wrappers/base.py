@@ -7,6 +7,7 @@ from data_struct.transitions import TransitionInfo
 from data_struct.qd_transitions import QDTransitionInfo
 from brax.envs.base import State
 from flax.struct import PyTreeNode
+import flax.linen as nn
 
 
 
@@ -156,3 +157,81 @@ class BaseQDTaskWrapper(Wrapper, abc.ABC):
             2) shift and pad reshaped_sequence
         """
         pass
+
+
+
+
+class BaseFlowQDWrapper(Wrapper, abc.ABC):
+
+    def __init__(self, env: Env, flow: nn.Module, way_points: int, steps_per_way_point: int, dt: float):
+        super().__init__(env)
+        self.has_z = True
+        self.flow = flow
+        self.way_points = way_points
+        self.steps_per_way_point = steps_per_way_point
+        self.dt = dt
+
+        self.max_step_num = int(way_points * steps_per_way_point)
+        self.horizon = way_points * steps_per_way_point * dt
+        self.period_t = steps_per_way_point * dt
+
+
+    @property
+    @abc.abstractmethod
+    def z_size(self) -> int:
+        pass
+    
+
+    @abc.abstractmethod
+    def get_obs(self, state: GeneralizedQDState) -> Tuple[jax.Array, jax.Array]:
+        """extract observations and z"""
+        pass
+
+
+    @abc.abstractmethod
+    def sample_task(self, env_state: State, key: jax.Array, params: PyTreeNode) -> PyTreeNode:
+        """initialize task state"""
+        pass
+
+
+    def reset(self, key: jax.Array, params: PyTreeNode) -> GeneralizedQDState:
+        env_key, task_key, key = jax.random.split(key, num=3)
+        env_state = self.env.reset(env_key)
+        z_state = self.sample_task(env_state, task_key, params)
+        
+        state = GeneralizedQDState(
+            env_state=env_state, 
+            z_state=z_state, 
+            initial_z_state=z_state, 
+            key=key,
+            )
+        return state
+    
+
+    def resample_task_state(self, state: GeneralizedQDState, params: PyTreeNode) -> GeneralizedQDState:
+        """resample task state"""
+        key, subkey = jax.random.split(state.key)
+        z_state = self.sample_task(state.env_state, subkey, params)
+        state = state.replace(z_state=z_state, key=key)
+        return state
+
+
+    @abc.abstractmethod
+    def step(
+        self, 
+        state: GeneralizedQDState, 
+        action: jax.Array,
+    ) -> Tuple[GeneralizedQDState, QDTransitionInfo]:
+        """return next state, and transition information"""
+        pass
+
+
+    @abc.abstractmethod
+    def shift(self, state: GeneralizedQDState) -> GeneralizedQDState:
+        """
+        To shift:
+            1) take cycle_t - self.period_t
+            2) shift and pad reshaped_sequence
+        """
+        pass
+
