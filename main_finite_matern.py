@@ -21,11 +21,11 @@ from data_struct.states import GeneralizedState
 
 vec_env = 4096
 mini_batch_size = 16384
-num_iterations = 4000
+num_iterations = 2000
 policy_epochs = 4
 critic_epochs = 4
 fitness_critic_epochs = 4
-policy_learning_rate_per_std = 1e-3 # unified
+policy_learning_rate_per_std = 8e-4 # unified
 critic_learning_rate = 5e-4
 rollout_length = 96
 
@@ -81,7 +81,7 @@ loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", reset_noise_scale=0.0)
-env = AntFiniteMaternWrapper(env, inner_radius=1.0, max_radius=2, tolerance_radius=0.2) # for horizon = 4.8 seconds
+env = AntFiniteMaternWrapper(env, inner_radius=0.5, max_radius=2, tolerance_radius=0.1, var=4) # for horizon = 4.8 seconds
 
 
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
