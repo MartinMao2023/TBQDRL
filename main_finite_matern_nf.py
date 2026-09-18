@@ -7,15 +7,13 @@ import wandb
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-from datetime import datetime
-from custom_types import RNGKey, Params
-from typing import Any, Tuple, List
+from custom_types import RNGKey
+from typing import Tuple
 from algorithms.trajectory_ppo import PPO, PPOConfigs, PPOTrainingState
-# from data_struct.transitions import PPOTransition
 from networks import GCMLP, PPO_Policy
-# from functools import partial
 from flax import serialization
-from task_wrappers.trajectory_following import AntFiniteMaternWrapper
+from jax_rq_nsf import FlowConfig, init_flow
+from task_wrappers.nf_trajectory_following import AntFiniteMaternWrapper
 from data_struct.states import GeneralizedState
 
 
@@ -29,9 +27,19 @@ policy_learning_rate_per_std = 8e-4 # unified
 critic_learning_rate = 5e-4
 rollout_length = 96
 
+flow_checkpoint_path = "./output/trajectory_flow_variables.msgpack"
+flow_config = FlowConfig(
+    dimension=50,
+    num_layers=8,
+    hidden_features=(128, 128),
+    num_bins=16,
+    tail_bound=6.0,
+)
+
 description = {
-        "task": "Test new trajectory PPO with Ant",
-        "v_var": 4,
+        "task": "Test trajectory PPO with cloned NF distribution",
+        "cloned_target_var": 4,
+        "flow_checkpoint": flow_checkpoint_path,
         "policy_learning_rate": policy_learning_rate_per_std,
         "critic_learning_rate": critic_learning_rate,
         "architecture": "Simple MLP for both networks",
@@ -50,7 +58,7 @@ description_text = "\n".join(
 )
 
 
-folder_path = f"./output/matern/saved_data"
+folder_path = "./output/nf_matern/saved_data"
 
 if not os.path.exists(folder_path):
     os.makedirs(folder_path, exist_ok=True)
@@ -76,12 +84,29 @@ ppo_config = PPOConfigs(
 )
 
 
+flow, flow_variables_template = init_flow(
+    jax.random.PRNGKey(0),
+    flow_config,
+)
+with open(flow_checkpoint_path, "rb") as f:
+    flow_variables = serialization.from_bytes(
+        flow_variables_template,
+        f.read(),
+    )
+
+
 seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
 env = envs.create(env_name="ant", episode_length=4096, backend="mjx", reset_noise_scale=0.0)
-env = AntFiniteMaternWrapper(env, inner_radius=0.5, max_radius=2, tolerance_radius=0.1, var=4) # for horizon = 4.8 seconds
+env = AntFiniteMaternWrapper(
+    env,
+    flow,
+    inner_radius=0.5,
+    max_radius=2,
+    tolerance_radius=0.1,
+) # for horizon = 4.8 seconds
 
 
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
@@ -116,17 +141,19 @@ seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
-initial_states = jax.vmap(env.reset)(subkeys)
-
+initial_states = jax.vmap(env.reset, in_axes=(0, None))(
+    subkeys,
+    flow_variables,
+)
 
 carry = (initial_states, ppo_training_state, loop_random_key)
 
 
 @jax.jit
 def training_loop(
-    carry: Tuple[GeneralizedState, PPOTrainingState, RNGKey], 
+    carry: Tuple[GeneralizedState, PPOTrainingState, RNGKey],
     _: None,
-    ) -> Tuple[Tuple, Tuple]:
+) -> Tuple[Tuple, Tuple]:
 
     states, ppo_training_state, loop_random_key = carry
 
@@ -136,8 +163,11 @@ def training_loop(
         loop_random_key,
     )
     vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
-    states = jax.vmap(env.resample_task_state)(initial_states)
-    
+    states = jax.vmap(
+        env.resample_task_state,
+        in_axes=(0, None),
+    )(initial_states, flow_variables)
+
     new_carry = (
         states,
         ppo_training_state,
@@ -150,7 +180,7 @@ def training_loop(
 wandb.init(
     entity="airl-lab",
     project="TBQDRL",
-    group="Trajectory PPO test",
+    group="Trajectory NF PPO test",
     config=description,
 )
 
@@ -160,10 +190,10 @@ log_period = 10
 for i in range(int(num_iterations / log_period)):
 
     (
-        states, 
-        ppo_training_state, 
+        states,
+        ppo_training_state,
         loop_random_key,
-        ), (stacked_aux_data, iteration_mean_v) = jax.lax.scan(
+    ), (stacked_aux_data, iteration_mean_v) = jax.lax.scan(
         training_loop,
         carry,
         length=log_period,
@@ -172,29 +202,28 @@ for i in range(int(num_iterations / log_period)):
     wandb.log({
         "critic_RMSE": jnp.mean(stacked_aux_data.critic_rmse),
         "approx_kl": jnp.mean(stacked_aux_data.policy_approx_kl),
-        "iteration mean return": jnp.mean(stacked_aux_data.average_return), 
+        "iteration mean return": jnp.mean(stacked_aux_data.average_return),
         "iteration mean reward": jnp.mean(stacked_aux_data.average_reward),
         "dones per episode": jnp.mean(stacked_aux_data.done_count) / vec_env,
         # "gae mean": jnp.mean(stacked_aux_data.gae_mean),
-        "iteration_mean_v": jnp.mean(iteration_mean_v), 
-        })
-    
+        "iteration_mean_v": jnp.mean(iteration_mean_v),
+    })
+
     carry = (states, ppo_training_state, loop_random_key)
 
 (
-    _, 
-    final_ppo_training_state, 
+    _,
+    final_ppo_training_state,
     loop_random_key,
 ) = carry
 
 model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
 critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
 
-with open(folder_path + f"/policy.msgpack", "wb") as f:
+with open(folder_path + "/policy.msgpack", "wb") as f:
     f.write(model_bytes)
 
-with open(folder_path + f"/critic.msgpack", "wb") as f:
+with open(folder_path + "/critic.msgpack", "wb") as f:
     f.write(critic_bytes)
 
 wandb.finish()
-

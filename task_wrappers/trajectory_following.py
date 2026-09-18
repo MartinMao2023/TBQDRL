@@ -49,7 +49,7 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         steps_per_way_point: int = 8,
         var: float = 2.25,
         l: float = 1,
-        tolerance_radius: float = 0.0,
+        tolerance_radius: float = 0.1,
         inner_radius: float = 0.5,
         outer_radius: float = 1.5,
         max_radius: float = 3.0,
