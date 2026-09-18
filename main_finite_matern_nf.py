@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from brax import envs
 import wandb
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from custom_types import RNGKey
 from typing import Tuple

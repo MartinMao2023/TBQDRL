@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import json
 import math
 from dataclasses import asdict
