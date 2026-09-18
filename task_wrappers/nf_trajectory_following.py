@@ -14,7 +14,7 @@ from task_wrappers.base import BaseFlowQDWrapper
 from data_struct.qd_transitions import QDTransitionInfo
 from custom_types import Params, RNGKey, Env, EnvState
 from .tools import IntegrateMatern
-from ..jax_rq_nsf import NormalizingFlow
+from jax_rq_nsf import NormalizingFlow
 
 
 
@@ -46,7 +46,6 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
         flow: NormalizingFlow,
         way_points: int = 12,
         steps_per_way_point: int = 8,
-        var: float = 2.25,
         l: float = 1,
         tolerance_radius: float = 0.0,
         inner_radius: float = 0.5,
@@ -166,12 +165,13 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
         """initialize task state"""
 
         # sample way_points data
-        sampled_sequence = self.flow.apply(params, )
-
-        
-
-
-
+        sampled_sequence = self.flow.apply(
+            params,
+            key,
+            1,
+            method=self.flow.sample,
+        ) # shape of (4 * way_points + 2,)
+        sampled_sequence = jnp.reshape(sampled_sequence, (2, 2 * self.way_points + 1))
         position_offset=-self._get_position_from_envstate(env_state)
         task_state = self._organize_z_state(sampled_sequence, position_offset)
 

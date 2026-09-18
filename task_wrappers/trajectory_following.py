@@ -18,6 +18,10 @@ from .tools import IntegrateMatern
 
 
 class MaternTaskState(PyTreeNode):
+    """
+    z: [sin(cycle_t), cos(cycle_t), 2 * task_t - 1, deviation_x, deviation_y] + sequence
+    sequence: 2 x [ds_1 / T, ds_2 / T, ..., ds_n / T, v_0, v_1, ..., v_n]
+    """
     position_offset: jax.Array # (2,)
     last_action: jax.Array # (action_dim,)
 
@@ -27,7 +31,6 @@ class MaternTaskState(PyTreeNode):
     steps_taken: jax.Array
     cycle_t: float # absolute time within a period
     z: jnp.ndarray # (-1,)
-    # z: [s1_x, v1_x, s2_x, v2_x, ..., s1_y, v1_y, s2_y, s2_y, ..., sin(cycle_t), cos(cycle_t), 2 * task_t - 1]
 
 
 class GeneralizedState(PyTreeNode):
@@ -60,7 +63,7 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         self.t_normalization_scale = dt * 2 / self.horizon
 
         period_t = self.period_t
-        self.y_scale = jnp.array([1.0] + [1 / period_t for i in range(way_points)])
+        self.inv_period_t = 1 / self.period_t
         self.omega = jnp.pi * 2 / period_t
 
         self.tolerance_radius = tolerance_radius
@@ -93,18 +96,20 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
             [0.0, 0.0, 0.0, 0.0],
         ]) 
 
-        P = np.zeros((way_points * 2 + 1, way_points * 2 + 1))
-        for i in range(way_points):
-            P[i, 2 * i + 1] = 1
-        for i in range(way_points + 1):
-            P[way_points + i, 2 * i] = 1
-        prior_cov = var * (P.T @ prior_cov @ P)
 
         # Posterior sampling: Sigma12 @ Sigma22_inv @ Y = Sigma12 * v / Var_y
-        Sigma12 = prior_cov[:, :1] # (all x 1)
+        P = np.eye(way_points * 2 + 1)
+        for i in range(way_points - 1):
+            P[i, i + 1] = - 1 / self.period_t
+        for i in range(way_points):
+            P[i, i] = 1 / self.period_t
+        prior_cov = var * (P.T @ prior_cov @ P)
+
+        Sigma12 = prior_cov[:, way_points: way_points + 1] # (all x 1)
         self.posterior_mu_T = jnp.array(Sigma12.T / (var + v_noise_var), dtype=jnp.float32) # (1, 2 * way_points + 1)
         posterior_cov = prior_cov - Sigma12 @ Sigma12.T / (var + v_noise_var)
         self.posterior_L = jnp.array(lg.cholesky(posterior_cov), dtype=jnp.float32) # target = L @ X 
+
 
         # Inference -> (2,)
         self._base_fn = lambda t: jnp.array([1.0, jnp.exp(-t/l), jnp.exp(t/l), t]) # (4,)
@@ -138,25 +143,28 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
 
     def _organize_z_state(self, sampled_sequence: jax.Array, position_offset: jax.Array) -> MaternTaskState:
 
-        task_sequence = jnp.concatenate(
-            [jnp.zeros((2, 1)), sampled_sequence, sampled_sequence[:, -2:-1], jnp.zeros((2, 1))],
-            axis=-1,
-        ) # (2, 2 * way_points + 4)
-        task_sequence = jnp.reshape(task_sequence, (2, -1, 2)) # (2, way_points + 2, 2)
+        """
+        sampled sequence: 2 x [ds_1 / T, ds_2 / T, ..., ds_n / T, v_0, v_1, ..., v_n]
+        """
+
+        ys = jnp.concatenate([
+            jnp.zeros((2, 1)), 
+            sampled_sequence[:, :self.way_points] * self.period_t, 
+            jnp.zeros((2, 1)),
+            ], axis=-1) # (2, way_points + 2)
+        ys = jnp.cumsum(ys, axis=-1) # (2, way_points + 2)
+        vs = jnp.concatenate([sampled_sequence[:, self.way_points:], jnp.zeros((2, 1))], axis=-1) # (2, way_points + 2)
+        task_sequence = jnp.concatenate([ys[..., None], vs[..., None]], axis=-1) # (2, way_points + 2, 2)
         reshaped_sequence = jnp.concatenate(
             [task_sequence[:, :-1], task_sequence[:, 1:]],
             axis=-1,
             ) # (2, way_points + 1, 4)
         padding_element = jnp.concatenate([task_sequence[:, -1:], task_sequence[:, -1:]], axis=-1) # (2, 1, 4)
-        ys = task_sequence[:, :-1, 0] # (2, way_points + 1)
-        ys = jnp.diff(ys, axis=1, prepend=0) * self.y_scale # special step for x-y position
-        vs = task_sequence[:, :-1, 1] # (2, way_points + 1)
-        presented_task_sequence = jnp.concatenate([ys[..., None], vs[..., None]], axis=-1) # (2, way_points + 1, 2)
 
         z = jnp.concatenate(
             [
-                jnp.reshape(presented_task_sequence, (-1,)),
-                jnp.array([0.0, 1.0, -1.0]),
+                jnp.array([0.0, 1.0, -1.0, 0.0, 0.0]),
+                jnp.reshape(sampled_sequence, (-1,)),
             ],
             axis=-1,
         )
@@ -180,6 +188,7 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
         # sample way_points data
         means = self.posterior_mu_T * env_state.obs[13:15, None] # (2, 2 * waypoints + 1)
         sampled_sequence = means + jax.random.normal(key, (2, 2 * self.way_points + 1)) @ self.posterior_L.T # (2, 2 * way_points + 1)
+
         position_offset=-self._get_position_from_envstate(env_state)
         task_state = self._organize_z_state(sampled_sequence, position_offset)
 
@@ -259,22 +268,20 @@ class AntFiniteMaternWrapper(BaseQDTaskWrapper):
             deviation,
             0.0,
             )
-        corrected_position = current_position + compensation # (2,)
-        normalized_ys = jnp.diff(shifted_ys - corrected_position[:, None], axis=-1, prepend=0) * self.y_scale
-        presented_task_sequence = jnp.concatenate([
-            normalized_ys[..., None], 
-            shifted_vs[..., None],
-            ], axis=-1) # (2, way_points + 1, 2)
+
+        corrected_deviation = deviation - compensation # (2,)
+        normalized_ds = (shifted_ys[:, 1:] - shifted_ys[:, :-1]) * self.inv_period_t # (2, way_points)
+        shifted_sequence = jnp.concatenate([normalized_ds, shifted_vs], axis=-1) # (2, 2 * way_points + 1)
 
         z = jnp.concatenate([
-            jnp.reshape(presented_task_sequence, (-1,)),
             jnp.array([
                 jnp.sin(self.omega * z_cycle_t), 
                 jnp.cos(self.omega * z_cycle_t), 
                 normalized_task_t,
                 ]),
+            corrected_deviation,
+            jnp.reshape(shifted_sequence, (-1,)),
             ], 
-            axis=-1,
         )
 
         next_task_state = z_state.replace(
@@ -353,18 +360,22 @@ class AntLineMaternWrapper(AntFiniteMaternWrapper):
             return (new_pos, new_vel), jnp.concatenate([new_pos, new_vel]) # (pos_x, pos_y, vel_x, vel_y)
 
 
-        _, sampled_sequence = jax.lax.scan(
+        _, way_point_sequence = jax.lax.scan(
             scan_track,
             (jnp.zeros((2,)), current_velocity),
             length=self.way_points,
         )
-        sampled_sequence = jnp.reshape(
-            jnp.concatenate([
-                current_velocity, 
-                jnp.reshape(sampled_sequence, (-1)),
-                ]),
-            (-1, 2),
-        ).T # (2, 2 * way_points + 1)
+        positions = way_point_sequence[:, :2].T # (2, way_points)
+        positions = jnp.concatenate([jnp.zeros((2, 1)), positions], axis=-1)
+        normalized_increments = jnp.diff(positions, axis=-1) * self.inv_period_t
+        velocities = jnp.concatenate(
+            [current_velocity[:, None], way_point_sequence[:, 2:].T],
+            axis=-1,
+        )
+        sampled_sequence = jnp.concatenate(
+            [normalized_increments, velocities],
+            axis=-1,
+        ) # (2, 2 * way_points + 1)
 
         position_offset=-self._get_position_from_envstate(env_state)
         task_state = self._organize_z_state(sampled_sequence, position_offset)
