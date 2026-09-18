@@ -60,7 +60,7 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
         self.t_normalization_scale = dt * 2 / self.horizon
 
         period_t = self.period_t
-        self.y_scale = jnp.array([1.0] + [1 / period_t for i in range(way_points)])
+        self.inv_period_t = 1 / period_t
         self.omega = jnp.pi * 2 / period_t
 
         self.tolerance_radius = tolerance_radius
@@ -125,25 +125,28 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
 
     def _organize_z_state(self, sampled_sequence: jax.Array, position_offset: jax.Array) -> MaternTaskState:
 
-        task_sequence = jnp.concatenate(
-            [jnp.zeros((2, 1)), sampled_sequence, sampled_sequence[:, -2:-1], jnp.zeros((2, 1))],
-            axis=-1,
-        ) # (2, 2 * way_points + 4)
-        task_sequence = jnp.reshape(task_sequence, (2, -1, 2)) # (2, way_points + 2, 2)
+        """
+        sampled sequence: 2 x [ds_1 / T, ds_2 / T, ..., ds_n / T, v_0, v_1, ..., v_n]
+        """
+
+        ys = jnp.concatenate([
+            jnp.zeros((2, 1)), 
+            sampled_sequence[:, :self.way_points] * self.period_t, 
+            jnp.zeros((2, 1)),
+            ], axis=-1) # (2, way_points + 2)
+        ys = jnp.cumsum(ys, axis=-1) # (2, way_points + 2)
+        vs = jnp.concatenate([sampled_sequence[:, self.way_points:], jnp.zeros((2, 1))], axis=-1) # (2, way_points + 2)
+        task_sequence = jnp.concatenate([ys[..., None], vs[..., None]], axis=-1) # (2, way_points + 2, 2)
         reshaped_sequence = jnp.concatenate(
             [task_sequence[:, :-1], task_sequence[:, 1:]],
             axis=-1,
             ) # (2, way_points + 1, 4)
         padding_element = jnp.concatenate([task_sequence[:, -1:], task_sequence[:, -1:]], axis=-1) # (2, 1, 4)
-        ys = task_sequence[:, :-1, 0] # (2, way_points + 1)
-        ys = jnp.diff(ys, axis=1, prepend=0) * self.y_scale # special step for x-y position
-        vs = task_sequence[:, :-1, 1] # (2, way_points + 1)
-        presented_task_sequence = jnp.concatenate([ys[..., None], vs[..., None]], axis=-1) # (2, way_points + 1, 2)
 
         z = jnp.concatenate(
             [
-                jnp.reshape(presented_task_sequence, (-1,)),
-                jnp.array([0.0, 1.0, -1.0]),
+                jnp.array([0.0, 1.0, -1.0, 0.0, 0.0]),
+                jnp.reshape(sampled_sequence, (-1,)),
             ],
             axis=-1,
         )
@@ -172,6 +175,7 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
             method=self.flow.sample,
         ) # shape of (4 * way_points + 2,)
         sampled_sequence = jnp.reshape(sampled_sequence, (2, 2 * self.way_points + 1))
+
         position_offset=-self._get_position_from_envstate(env_state)
         task_state = self._organize_z_state(sampled_sequence, position_offset)
 
@@ -251,22 +255,20 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
             deviation,
             0.0,
             )
-        corrected_position = current_position + compensation # (2,)
-        normalized_ys = jnp.diff(shifted_ys - corrected_position[:, None], axis=-1, prepend=0) * self.y_scale
-        presented_task_sequence = jnp.concatenate([
-            normalized_ys[..., None], 
-            shifted_vs[..., None],
-            ], axis=-1) # (2, way_points + 1, 2)
+        
+        corrected_deviation = deviation - compensation # (2,)
+        normalized_ds = (shifted_ys[:, 1:] - shifted_ys[:, :-1]) * self.inv_period_t # (2, way_points)
+        shifted_sequence = jnp.concatenate([normalized_ds, shifted_vs], axis=-1) # (2, 2 * way_points + 1)
 
         z = jnp.concatenate([
-            jnp.reshape(presented_task_sequence, (-1,)),
             jnp.array([
                 jnp.sin(self.omega * z_cycle_t), 
                 jnp.cos(self.omega * z_cycle_t), 
                 normalized_task_t,
                 ]),
+            corrected_deviation,
+            jnp.reshape(shifted_sequence, (-1,)),
             ], 
-            axis=-1,
         )
 
         next_task_state = z_state.replace(
