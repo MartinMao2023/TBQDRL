@@ -45,39 +45,6 @@ def _gather(values: Array, indices: Array) -> Array:
     return jnp.take_along_axis(values, indices[..., None], axis=-1)[..., 0]
 
 
-def _final_affine(
-    inputs: Array,
-    raw_scale: Array,
-    bias: Array,
-    *,
-    inverse: bool,
-) -> Array | tuple[Array, Array]:
-    """Apply an elementwise affine transform with stable positive scales."""
-    stable_scale = jnp.maximum(0.5, 1.0 + raw_scale)
-    stable_log_scale = jnp.clip(raw_scale, -5.0, 5.0)
-
-    if inverse:
-        inv_scale = jnp.where(
-            raw_scale < 0.0,
-            jnp.exp(-stable_log_scale),
-            1 / stable_scale,
-        )
-        log_scale = jnp.where(
-            raw_scale < 0.0,
-            stable_log_scale,
-            jnp.log(stable_scale),
-        )
-        outputs = (inputs - bias) * inv_scale
-        return outputs, -jnp.sum(log_scale)
-    else:
-        scale = jnp.where(
-            raw_scale < 0.0,
-            jnp.exp(stable_log_scale),
-            stable_scale,
-        )
-        return inputs * scale + bias
-
-
 def _rational_quadratic_spline(
     inputs: Array,
     parameters: Array,
@@ -88,7 +55,7 @@ def _rational_quadratic_spline(
     min_bin_width: float,
     min_bin_height: float,
     min_derivative: float,
-) -> Array | tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """Apply elementwise monotonic RQ splines with identity linear tails."""
     inside = (inputs >= -tail_bound) & (inputs <= tail_bound)
     spline_inputs = jnp.clip(inputs, -tail_bound, tail_bound)
@@ -158,18 +125,16 @@ def _rational_quadratic_spline(
         )
         outputs = y_left + numerator / denominator
 
-    outputs = jnp.where(inside, outputs, inputs)
-    if not inverse:
-        return outputs
-
     derivative_numerator = slope * slope * (
         derivative_right * theta * theta
         + 2.0 * slope * theta_product
         + derivative_left * one_minus_theta * one_minus_theta
     )
     log_det = jnp.log(derivative_numerator) - 2.0 * jnp.log(denominator)
-    log_det = -log_det
+    if inverse:
+        log_det = -log_det
 
+    outputs = jnp.where(inside, outputs, inputs)
     log_det = jnp.where(inside, log_det, 0.0)
     return outputs, log_det
 
@@ -221,19 +186,14 @@ class _SplineCoupling(nn.Module):
             output_size=len(self.transform_indices) * parameters_per_dimension,
         )
 
-    def _couple(
-        self,
-        inputs: Array,
-        *,
-        inverse: bool,
-    ) -> Array | tuple[Array, Array]:
+    def _couple(self, inputs: Array, *, inverse: bool) -> tuple[Array, Array]:
         identity = inputs[..., self.identity_indices]
         transformed = inputs[..., self.transform_indices]
         parameters = self.conditioner(identity)
         parameters = parameters.reshape(
             transformed.shape + (3 * self.num_bins - 1,)
         )
-        spline_result = _rational_quadratic_spline(
+        transformed, elementwise_log_det = _rational_quadratic_spline(
             transformed,
             parameters,
             inverse=inverse,
@@ -243,16 +203,10 @@ class _SplineCoupling(nn.Module):
             min_bin_height=self.min_bin_height,
             min_derivative=self.min_derivative,
         )
-        if inverse:
-            transformed, elementwise_log_det = spline_result
-        else:
-            transformed = spline_result
         outputs = inputs.at[..., self.transform_indices].set(transformed)
-        if inverse:
-            return outputs, jnp.sum(elementwise_log_det, axis=-1)
-        return outputs
+        return outputs, jnp.sum(elementwise_log_det, axis=-1)
 
-    def __call__(self, inputs: Array) -> Array:
+    def __call__(self, inputs: Array) -> tuple[Array, Array]:
         permuted = inputs[..., self.permutation_array]
         return self._couple(permuted, inverse=False)
 
@@ -292,16 +246,6 @@ class NormalizingFlow(nn.Module):
                 )
             )
         self.layers = tuple(layers)
-        self.final_raw_scale = self.param(
-            "final_raw_scale",
-            nn.initializers.zeros_init(),
-            (dimension,),
-        )
-        self.final_bias = self.param(
-            "final_bias",
-            nn.initializers.zeros_init(),
-            (dimension,),
-        )
 
     def _check_shape(self, inputs: Array) -> None:
         if inputs.ndim < 1 or inputs.shape[-1] != self.config.dimension:
@@ -310,32 +254,21 @@ class NormalizingFlow(nn.Module):
                 f"got shape {inputs.shape}"
             )
 
-    def forward(self, base_samples: Array) -> Array:
-        """Map base samples to data space without computing Jacobians."""
+    def forward(self, base_samples: Array) -> tuple[Array, Array]:
+        """Map base samples to data space and return the forward log-Jacobian."""
         self._check_shape(base_samples)
         outputs = base_samples
+        log_det = jnp.zeros(base_samples.shape[:-1], dtype=base_samples.dtype)
         for layer in self.layers:
-            outputs = layer(outputs)
-        return _final_affine(
-            outputs,
-            self.final_raw_scale,
-            self.final_bias,
-            inverse=False,
-        )
+            outputs, layer_log_det = layer(outputs)
+            log_det = log_det + layer_log_det
+        return outputs, log_det
 
     def inverse(self, samples: Array) -> tuple[Array, Array]:
         """Map data samples to base space and return the inverse log-Jacobian."""
         self._check_shape(samples)
-        outputs, affine_log_det = _final_affine(
-            samples,
-            self.final_raw_scale,
-            self.final_bias,
-            inverse=True,
-        )
-        log_det = (
-            jnp.zeros(samples.shape[:-1], dtype=samples.dtype)
-            + affine_log_det
-        )
+        outputs = samples
+        log_det = jnp.zeros(samples.shape[:-1], dtype=samples.dtype)
         for layer in reversed(self.layers):
             outputs, layer_log_det = layer.inverse(outputs)
             log_det = log_det + layer_log_det
@@ -355,12 +288,20 @@ class NormalizingFlow(nn.Module):
     def __call__(self, samples: Array) -> Array:
         return self.log_prob(samples)
 
-    def sample(self, key: Array, num_samples: int) -> Array:
-        """Draw samples without computing their density."""
+    def sample_and_log_prob(
+        self, key: Array, num_samples: int
+    ) -> tuple[Array, Array]:
+        """Draw samples and return their normalized log-density."""
         base_samples = jax.random.normal(
             key, (num_samples, self.config.dimension)
         )
-        return self.forward(base_samples)
+        samples, forward_log_det = self.forward(base_samples)
+        return samples, self.base_log_prob(base_samples) - forward_log_det
+
+    def sample(self, key: Array, num_samples: int) -> Array:
+        """Draw samples from the flow."""
+        samples, _ = self.sample_and_log_prob(key, num_samples)
+        return samples
 
 
 def init_flow(

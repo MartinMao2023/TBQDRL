@@ -151,15 +151,15 @@ def create_train_state(
     )
     state = TrainState.create(
         apply_fn=flow.apply,
-        params=variables["params"],
+        params=variables,
         tx=optimizer,
     )
     return flow, state
 
 
-def count_parameters(params: Any) -> int:
+def count_parameters(variables: Any) -> int:
     """Count scalar trainable parameters in a JAX parameter pytree."""
-    return sum(parameter.size for parameter in jax.tree.leaves(params))
+    return sum(parameter.size for parameter in jax.tree.leaves(variables))
 
 
 def make_sample_chunk(
@@ -203,8 +203,8 @@ def make_train_scan(
         ) -> tuple[TrainState, dict[str, jax.Array]]:
             coordinates, brightness = samples
 
-            def loss_fn(params: Any) -> tuple[jax.Array, dict[str, jax.Array]]:
-                log_prob = flow.apply({"params": params}, coordinates)
+            def loss_fn(variables: Any) -> tuple[jax.Array, dict[str, jax.Array]]:
+                log_prob = flow.apply(variables, coordinates)
                 negative_log_prob = -log_prob
 
                 # Self-normalized importance weighting approximates expectation
@@ -245,7 +245,7 @@ def save_result(
     image_shape: tuple[int, int],
     config: FlowConfig = FLOW_CONFIG,
 ) -> None:
-    """Save trained parameters and the information needed to reconstruct them."""
+    """Save the complete variables tree and reconstruction metadata."""
     CHECKPOINT_PATH.write_bytes(flax.serialization.to_bytes(state.params))
     metadata = {
         "flow_config": asdict(config),
@@ -262,7 +262,7 @@ def save_result(
 
 def evaluate_density_grid(
     flow: NormalizingFlow,
-    params: Any,
+    variables: Any,
     *,
     grid_size: int = DENSITY_GRID_SIZE,
     evaluation_batch_size: int = DENSITY_EVALUATION_BATCH_SIZE,
@@ -289,13 +289,13 @@ def evaluate_density_grid(
 
     @jax.jit
     def evaluate_batches(
-        current_params: Any, batches: jax.Array
+        current_variables: Any, batches: jax.Array
     ) -> jax.Array:
         def evaluate_batch(
             carry: None, batch: jax.Array
         ) -> tuple[None, jax.Array]:
             log_prob = flow.apply(
-                {"params": current_params},
+                current_variables,
                 batch,
                 method=flow.log_prob,
             )
@@ -308,7 +308,7 @@ def evaluate_density_grid(
         )
         return log_prob_batches
 
-    log_density = evaluate_batches(params, coordinate_batches)
+    log_density = evaluate_batches(variables, coordinate_batches)
     density = jnp.exp(log_density).reshape(grid_size, grid_size)
     return np.asarray(density, dtype=np.float32)
 
