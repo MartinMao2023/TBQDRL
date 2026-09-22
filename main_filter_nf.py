@@ -149,10 +149,11 @@ def make_train_chunk(
                 zs,
             )[..., 0]
             clipped_logits = jnp.minimum(critic_logits, TARGET_LOGIT)
-            log_likelihood = -sigmoid_binary_cross_entropy(
-                clipped_logits,
-                TARGET_PROBABILITY,
-            )
+            # log_likelihood = -sigmoid_binary_cross_entropy(
+            #     clipped_logits,
+            #     TARGET_PROBABILITY,
+            # )
+            log_likelihood = -jnp.square(clipped_logits - TARGET_LOGIT)
 
             old_log_prob = flow.apply(
                 old_flow_variables,
