@@ -7,16 +7,20 @@ import wandb
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-from datetime import datetime
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
-from algorithms.test_ppo import PPO, PPOConfigs, PPOTrainingState
-# from data_struct.transitions import PPOTransition
-from networks import GCMLP, PPO_Policy, ComplexGCMLP
-# from functools import partial
+from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
+from networks import GCMLP, PPO_Policy
 from flax import serialization
 # from task_wrappers.ant_wrapper import AntWrapper
-from task_wrappers.ant_mo_wrapper import AntMOWrapper
+from task_wrappers.humanoid_mo_wrapper import HumanoidMOWrapper
 from data_struct.states import GeneralizedState
 
 
@@ -26,7 +30,7 @@ num_iterations = 2000
 policy_epochs = 4
 critic_epochs = 4
 # policy_learning_rate_per_std = 1e-3 # unified
-policy_learning_rate_per_std = 1e-3 # unified
+policy_learning_rate_per_std = 2e-4 # unified
 critic_learning_rate = 5e-4
 rollout_length = 32
 
@@ -35,7 +39,7 @@ description = {
         "policy_learning_rate": policy_learning_rate_per_std,
         "critic_learning_rate": critic_learning_rate,
         "architecture": "Simple MLP for both networks",
-        "learnable std": True,
+        "learnable std": False,
         "vec_env": vec_env,
         "batchsize": mini_batch_size,
         "rollout_length": rollout_length,
@@ -49,31 +53,10 @@ description_text = "\n".join(
 )
 
 
-wandb.init(
-    entity="airl-lab",
-    group="MORL tests",
-    project="TBQDRL",
-    config=description,
-)
-
-
-# timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-# folder_path = f"./output/matern/output_{timestamp}"
-
-# if not os.path.exists(folder_path):
-#     os.makedirs(folder_path, exist_ok=True)
-#     print(f"new folder <{folder_path}> created")
-
-
-# with open(folder_path + "/description.log", "w") as f:
-#     f.write(description_text)
-
-
 ppo_config = PPOConfigs(
     policy_learning_rate_per_std=policy_learning_rate_per_std,
     critic_learning_rate=critic_learning_rate,
     clip_ratio=0.2,
-    approx_kl_threshold=0.0125,
     entropy_gain=0.001,
     discount=0.99,
     gae_lambda=0.95,
@@ -90,8 +73,8 @@ seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
 
 # # creat environment (Ant)
-env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
-env = AntMOWrapper(env)
+env = envs.create(env_name="humanoid", episode_length=4096, backend="mjx", auto_reset=True, action_repeat=2)
+env = HumanoidMOWrapper(env)
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
@@ -99,7 +82,6 @@ actor_hidden_layers: Tuple[int, ...] = (256, 256)
 policy_network = PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
-    initial_std_logits=None,
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.silu,
@@ -137,15 +119,16 @@ def training_loop(
 
     states, ppo_training_state, loop_random_key = carry
 
-    (final_states, sampled_states, ppo_training_state, loop_random_key), metrics = ppo.train(
+    (final_states, sampled_states, ppo_training_state, loop_random_key), metric = ppo.train(
         states,
         ppo_training_state,
         loop_random_key,
     )
-    vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
+    v = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 22: 23]**2, axis=-1))
 
     resampled_states = jax.vmap(env.resample_task_state)(final_states)
     loop_random_key, subkey = jax.random.split(loop_random_key)
+    # ps = jax.random.bernoulli(subkey, p=0.085, shape=(vec_env,))
     ps = jax.random.bernoulli(subkey, p=0.25, shape=(vec_env,))
 
     new_states = jax.tree.map(
@@ -160,17 +143,15 @@ def training_loop(
         loop_random_key,
     )
 
-    return new_carry, (
-        metrics.critic_rmse,
-        metrics.policy_approx_kl,
-        metrics.average_reward,
-        metrics.average_return,
-        metrics.done_count,
-        jnp.mean(vs),
-        metrics.gae_mean,
-        metrics.gae_std,
-        )
+    return new_carry, (metric, v)
 
+
+wandb.init(
+    entity="airl-lab",
+    group="MORL tests",
+    project="TBQDRL",
+    config=description,
+)
 
 log_period = 10
 
@@ -180,16 +161,7 @@ for i in range(int(num_iterations / log_period)):
         states, 
         ppo_training_state, 
         loop_random_key,
-        ), (
-            iteration_critic_error,
-            iteration_approx_kl,
-            iteration_average_reward,
-            iteration_mean_return,
-            iteration_done_count,
-            iteration_mean_v,
-            gae_means,
-            gae_stds,
-            ) = jax.lax.scan(
+        ), (metrics, vs) = jax.lax.scan(
         training_loop,
         carry,
         length=log_period,
@@ -197,26 +169,20 @@ for i in range(int(num_iterations / log_period)):
 
 
     wandb.log({
-        "critic_RMSE": jnp.mean(iteration_critic_error),
-        "approx_kl": jnp.mean(iteration_approx_kl),
-        "average_reward": jnp.mean(iteration_average_reward),
-        "iteration mean return": jnp.mean(iteration_mean_return),
-        "done_count": jnp.mean(iteration_done_count),
-        "iteration_mean_v": jnp.mean(iteration_mean_v),
-        "GAE mean": jnp.mean(gae_means),
-        "GAE std": jnp.mean(gae_stds),
+        "critic_RMSE": jnp.mean(metrics.critic_rmse),
+        "approx_kl": jnp.mean(metrics.policy_approx_kl),
+        "iteration mean return": jnp.mean(metrics.average_return), 
+        "iteration_mean_v": jnp.mean(vs),
+        "gae std": jnp.mean(metrics.gae_std)
         })
 
     carry = (states, ppo_training_state, loop_random_key)
 
-    # if jnp.mean(iteration_mean_return) > 70:
-    #     print("early break!")
-    #     break
+    if jnp.mean(metrics.average_return) > 150:
+        print("early break!")
+        break
 
 
-# =================================
-#      Save model parameters
-# =================================
 
 (
     final_states, 
@@ -228,21 +194,21 @@ model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
 critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
 
 
-# folder_path = f"./output/MORL/ant_mo_long"
+folder_path = f"./output/MORL/huamnoid_150"
 
-# if not os.path.exists(folder_path):
-#     os.makedirs(folder_path, exist_ok=True)
-#     print(f"new folder <{folder_path}> created")
+if not os.path.exists(folder_path):
+    os.makedirs(folder_path, exist_ok=True)
+    print(f"new folder <{folder_path}> created")
 
-# with open(folder_path + f"/policy.msgpack", "wb") as f:
-#     f.write(model_bytes)
+with open(folder_path + f"/policy.msgpack", "wb") as f:
+    f.write(model_bytes)
 
-# with open(folder_path + f"/critic.msgpack", "wb") as f:
-#     f.write(critic_bytes)
+with open(folder_path + f"/critic.msgpack", "wb") as f:
+    f.write(critic_bytes)
 
-# jnp.save(folder_path + "/mean.npy", final_ppo_training_state.moving_mean)
-# jnp.save(folder_path + "/var.npy", final_ppo_training_state.moving_squared_diff)
-# jnp.save(folder_path + "/mse.npy", final_ppo_training_state.moving_mse)
+jnp.save(folder_path + "/mean.npy", final_ppo_training_state.moving_mean)
+jnp.save(folder_path + "/var.npy", final_ppo_training_state.moving_squared_diff)
+jnp.save(folder_path + "/mse.npy", final_ppo_training_state.moving_mse)
 
 wandb.finish()
 

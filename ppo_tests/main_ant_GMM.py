@@ -7,31 +7,38 @@ import wandb
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+from pathlib import Path
+import sys
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from datetime import datetime
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
+from algorithms.gmm_ppo import PPO, PPOConfigs, PPOTrainingState
+from networks import GCMLP, Multi_Action_PPO_Policy, Selector
 from flax import serialization
-from task_wrappers.humanoid_wrapper import HumanoidWrapper
+from task_wrappers.ant_wrapper import AntWrapper
 from data_struct.states import GeneralizedState
-from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
-from networks import GCMLP, PPO_Policy
-
-
 
 vec_env = 4096
 mini_batch_size = 8192
 num_iterations = 1000
 policy_epochs = 4
 critic_epochs = 4
-policy_learning_rate_per_std = 3e-4 # unified
+policy_learning_rate_per_std = 1e-3 # unified
 critic_learning_rate = 5e-4
+selector_learning_rate = 3e-4
 rollout_length = 32
 
 description = {
-        "task": "Test simple ant PPO",
+        "task": "Decoupled GMM PPO test",
         "policy_learning_rate": policy_learning_rate_per_std,
         "critic_learning_rate": critic_learning_rate,
-        "architecture": "Simple MLP for both networks",
+        "selector_learning_rate": selector_learning_rate,
+        "architecture": "Separate MLPs for action means and selector",
         "learnable std": False,
         "vec_env": vec_env,
         "batchsize": mini_batch_size,
@@ -46,10 +53,21 @@ description_text = "\n".join(
 )
 
 
+# timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+folder_path = f"./output/GMM_decoupled"
+
+if not os.path.exists(folder_path):
+    os.makedirs(folder_path, exist_ok=True)
+    print(f"new folder <{folder_path}> created")
+
+with open(folder_path + "/description.log", "w") as f:
+    f.write(description_text)
+
 
 ppo_config = PPOConfigs(
     policy_learning_rate_per_std=policy_learning_rate_per_std,
     critic_learning_rate=critic_learning_rate,
+    selector_learning_rate=selector_learning_rate,
     clip_ratio=0.2,
     entropy_gain=0.001,
     discount=0.99,
@@ -62,24 +80,39 @@ ppo_config = PPOConfigs(
 )
 
 
-# seed = 8848
-seed = 4242
+seed = 6677
+# seed = 42
 loop_random_key = jax.random.PRNGKey(seed)
+loop_random_key, subkey = jax.random.split(loop_random_key)
 
-# # creat environment (Humanoid)
-env = envs.create(env_name="humanoid", episode_length=4096, backend="mjx", auto_reset=True, action_repeat=2)
-env = HumanoidWrapper(env)
+# # creat environment (Ant)
+env = envs.create(env_name="ant", episode_length=4096, backend="mjx", auto_reset=True)
+env = AntWrapper(env)
+component_means = jnp.concatenate([
+    jnp.zeros(env.action_size), jax.random.normal(subkey, shape=(3 * env.action_size)) * 0.25
+])
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
 actor_hidden_layers: Tuple[int, ...] = (256, 256)
-policy_network = PPO_Policy(
+selector_hidden_layers: Tuple[int, ...] = (128, 128)
+policy_network = Multi_Action_PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.silu,
     final_activation=jnp.tanh,
+    component_num=4,
+    component_means=component_means,   
+)
+
+selector_network = Selector(
+    hidden_layer_sizes=selector_hidden_layers,
+    component_num=4,
+    kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
+    kernel_init_final=jax.nn.initializers.orthogonal(0.01),
+    activation=nn.silu,
 )
 
 critic_network = GCMLP(
@@ -89,10 +122,10 @@ critic_network = GCMLP(
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
 )
 
-
 ppo = PPO(
     env=env,
     policy_network=policy_network,
+    selector_network=selector_network,
     critic_network=critic_network,
     ppo_configs=ppo_config,
 )
@@ -100,7 +133,7 @@ ppo = PPO(
 loop_random_key, subkey = jax.random.split(loop_random_key)
 ppo_training_state = ppo.init(subkey)
 
-seed = 114514
+seed = 8848
 loop_random_key = jax.random.PRNGKey(seed)
 loop_random_key, subkey = jax.random.split(loop_random_key)
 subkeys = jax.random.split(subkey, num=vec_env)
@@ -121,7 +154,7 @@ def training_loop(
         ppo_training_state,
         loop_random_key,
     )
-    vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 22: 23]**2, axis=-1))
+    vs = jnp.sqrt(jnp.sum(sampled_states.env_state.obs[:, 13: 15]**2, axis=-1))
 
     
     loop_random_key, subkey = jax.random.split(loop_random_key)
@@ -141,16 +174,15 @@ def training_loop(
 
     return new_carry, (aux_data, jnp.mean(vs))
 
-
+log_period = 10
 
 wandb.init(
     entity="airl-lab",
-    # group="",
+    group="GMM tests",
     project="TBQDRL",
     config=description,
 )
 
-log_period = 10
 
 for i in range(int(num_iterations / log_period)):
 
@@ -169,29 +201,33 @@ for i in range(int(num_iterations / log_period)):
         "critic_RMSE": jnp.mean(stacked_aux_data.critic_rmse),
         "approx_kl": jnp.mean(stacked_aux_data.policy_approx_kl),
         "iteration mean return": jnp.mean(stacked_aux_data.average_return), 
+        "selection entropy": jnp.mean(stacked_aux_data.selection_entropy),
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
 
     carry = (states, ppo_training_state, loop_random_key)
 
-# (
-#     final_states, 
-#     final_ppo_training_state, 
-#     loop_random_key,
-# ) = carry
+(
+    final_states, 
+    final_ppo_training_state, 
+    loop_random_key,
+) = carry
 
 # model_bytes = serialization.to_bytes(final_ppo_training_state.policy_params)
 # critic_bytes = serialization.to_bytes(final_ppo_training_state.critic_params)
-# fitness_critic_bytes = serialization.to_bytes(final_ppo_training_state.fitness_critic_params)
+# selector_bytes = serialization.to_bytes(final_ppo_training_state.selector_params)
 
-# with open(folder_path + f"/model_{structure}.msgpack", "wb") as f:
+
+# with open(folder_path + f"/policy.msgpack", "wb") as f:
 #     f.write(model_bytes)
 
-# with open(folder_path + f"/critic_{structure}.msgpack", "wb") as f:
+# with open(folder_path + f"/critic.msgpack", "wb") as f:
 #     f.write(critic_bytes)
+
+# with open(folder_path + f"/selector.msgpack", "wb") as f:
+#     f.write(selector_bytes)
 
 # with open(folder_path + f"/fitness_critic_{structure}.msgpack", "wb") as f:
 #     f.write(fitness_critic_bytes)
 
 wandb.finish()
-

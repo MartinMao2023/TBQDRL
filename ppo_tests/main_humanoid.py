@@ -7,14 +7,21 @@ import wandb
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from custom_types import RNGKey, Params
 from typing import Any, Tuple, List
 from flax import serialization
 from task_wrappers.humanoid_wrapper import HumanoidWrapper
 from data_struct.states import GeneralizedState
-from algorithms.gmm_ppo import PPO, PPOConfigs, PPOTrainingState
-from networks import GCMLP, Multi_Action_PPO_Policy, Selector
+from algorithms.ppo import PPO, PPOConfigs, PPOTrainingState
+from networks import GCMLP, PPO_Policy
 
 
 
@@ -46,6 +53,7 @@ description_text = "\n".join(
 )
 
 
+
 ppo_config = PPOConfigs(
     policy_learning_rate_per_std=policy_learning_rate_per_std,
     critic_learning_rate=critic_learning_rate,
@@ -64,37 +72,21 @@ ppo_config = PPOConfigs(
 # seed = 8848
 seed = 4242
 loop_random_key = jax.random.PRNGKey(seed)
-loop_random_key, subkey = jax.random.split(loop_random_key)
 
 # # creat environment (Humanoid)
 env = envs.create(env_name="humanoid", episode_length=4096, backend="mjx", auto_reset=True, action_repeat=2)
 env = HumanoidWrapper(env)
-component_means = jnp.concatenate([
-    jnp.zeros(env.action_size), jax.random.normal(subkey, shape=(3 * env.action_size)) * 0.25
-])
-
 
 structure = "simple"
 critic_hidden_layers: Tuple[int, ...] = (128, 128)
 actor_hidden_layers: Tuple[int, ...] = (256, 256)
-selector_hidden_layers: Tuple[int, ...] = (128, 128)
-policy_network = Multi_Action_PPO_Policy(
+policy_network = PPO_Policy(
     hidden_layer_sizes=actor_hidden_layers,
     action_dim=env.action_size,
     kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
     kernel_init_final=jax.nn.initializers.orthogonal(0.01),
     activation=nn.silu,
     final_activation=jnp.tanh,
-    component_num=4,
-    component_means=component_means,   
-)
-
-selector_network = Selector(
-    hidden_layer_sizes=selector_hidden_layers,
-    component_num=4,
-    kernel_init=jax.nn.initializers.orthogonal(jnp.sqrt(2)),
-    kernel_init_final=jax.nn.initializers.orthogonal(0.01),
-    activation=nn.silu,
 )
 
 critic_network = GCMLP(
@@ -108,7 +100,6 @@ critic_network = GCMLP(
 ppo = PPO(
     env=env,
     policy_network=policy_network,
-    selector_network=selector_network,
     critic_network=critic_network,
     ppo_configs=ppo_config,
 )
@@ -158,9 +149,10 @@ def training_loop(
     return new_carry, (aux_data, jnp.mean(vs))
 
 
+
 wandb.init(
     entity="airl-lab",
-    group="GMM tests",
+    # group="",
     project="TBQDRL",
     config=description,
 )
@@ -184,7 +176,6 @@ for i in range(int(num_iterations / log_period)):
         "critic_RMSE": jnp.mean(stacked_aux_data.critic_rmse),
         "approx_kl": jnp.mean(stacked_aux_data.policy_approx_kl),
         "iteration mean return": jnp.mean(stacked_aux_data.average_return), 
-        "selection entropy": jnp.mean(stacked_aux_data.selection_entropy),
         "iteration_mean_v": jnp.mean(iteration_mean_v), 
         })
 

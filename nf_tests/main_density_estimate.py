@@ -7,6 +7,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import json
 import math
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -19,6 +20,11 @@ import numpy as np
 import optax
 import wandb
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIRECTORY.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from jax_rq_nsf import FlowConfig, NormalizingFlow, init_flow
 
 
@@ -26,7 +32,7 @@ from jax_rq_nsf import FlowConfig, NormalizingFlow, init_flow
 # Design choices
 # ---------------------------------------------------------------------------
 
-IMAGE_PATH = Path("image_512x384_mean_normalized.npy")
+IMAGE_PATH = SCRIPT_DIRECTORY / "image_512x384_mean_normalized.npy"
 CHECKPOINT_PATH = Path("density_flow_params.msgpack")
 METADATA_PATH = Path("density_flow_metadata.json")
 DENSITY_PATH = Path("density_estimate_512x512.npy")
