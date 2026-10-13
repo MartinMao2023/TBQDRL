@@ -51,6 +51,7 @@ def _final_affine(
     bias: Array,
     *,
     inverse: bool,
+    return_log_det: bool = False,
 ) -> Array | tuple[Array, Array]:
     """Apply an elementwise affine transform with stable positive scales."""
     stable_scale = jnp.maximum(0.5, 1.0 + raw_scale)
@@ -75,7 +76,15 @@ def _final_affine(
             jnp.exp(stable_log_scale),
             stable_scale,
         )
-        return inputs * scale + bias
+        outputs = inputs * scale + bias
+        if return_log_det:
+            log_scale = jnp.where(
+                raw_scale < 0.0,
+                stable_log_scale,
+                jnp.log(stable_scale),
+            )
+            return outputs, jnp.sum(log_scale)
+        return outputs
 
 
 def _rational_quadratic_spline(
@@ -83,6 +92,7 @@ def _rational_quadratic_spline(
     parameters: Array,
     *,
     inverse: bool,
+    return_log_det: bool = False,
     num_bins: int,
     tail_bound: float,
     min_bin_width: float,
@@ -159,7 +169,7 @@ def _rational_quadratic_spline(
         outputs = y_left + numerator / denominator
 
     outputs = jnp.where(inside, outputs, inputs)
-    if not inverse:
+    if not inverse and not return_log_det:
         return outputs
 
     derivative_numerator = slope * slope * (
@@ -168,7 +178,8 @@ def _rational_quadratic_spline(
         + derivative_left * one_minus_theta * one_minus_theta
     )
     log_det = jnp.log(derivative_numerator) - 2.0 * jnp.log(denominator)
-    log_det = -log_det
+    if inverse:
+        log_det = -log_det
 
     log_det = jnp.where(inside, log_det, 0.0)
     return outputs, log_det
@@ -226,6 +237,7 @@ class _SplineCoupling(nn.Module):
         inputs: Array,
         *,
         inverse: bool,
+        return_log_det: bool = False,
     ) -> Array | tuple[Array, Array]:
         identity = inputs[..., self.identity_indices]
         transformed = inputs[..., self.transform_indices]
@@ -237,18 +249,19 @@ class _SplineCoupling(nn.Module):
             transformed,
             parameters,
             inverse=inverse,
+            return_log_det=return_log_det,
             num_bins=self.num_bins,
             tail_bound=self.tail_bound,
             min_bin_width=self.min_bin_width,
             min_bin_height=self.min_bin_height,
             min_derivative=self.min_derivative,
         )
-        if inverse:
+        if inverse or return_log_det:
             transformed, elementwise_log_det = spline_result
         else:
             transformed = spline_result
         outputs = inputs.at[..., self.transform_indices].set(transformed)
-        if inverse:
+        if inverse or return_log_det:
             return outputs, jnp.sum(elementwise_log_det, axis=-1)
         return outputs
 
@@ -256,9 +269,140 @@ class _SplineCoupling(nn.Module):
         permuted = inputs[..., self.permutation_array]
         return self._couple(permuted, inverse=False)
 
+    def forward_with_log_det(self, inputs: Array) -> tuple[Array, Array]:
+        permuted = inputs[..., self.permutation_array]
+        return self._couple(
+            permuted,
+            inverse=False,
+            return_log_det=True,
+        )
+
     def inverse(self, inputs: Array) -> tuple[Array, Array]:
         outputs, log_det = self._couple(inputs, inverse=True)
         return outputs[..., self.inverse_permutation_array], log_det
+
+
+class InvertibleNSF(nn.Module):
+    """Distribution-free RQ-spline mapping between equal-sized encodings."""
+
+    config: FlowConfig
+    permute: bool = False
+
+    def setup(self) -> None:
+        dimension = self.config.dimension
+        layers = []
+        for layer_index in range(self.config.num_layers):
+            mask = tuple(
+                (coordinate + layer_index) % 2 == 0
+                for coordinate in range(dimension)
+            )
+            if self.permute:
+                shift = layer_index % dimension
+                permutation = tuple(
+                    list(range(dimension))[shift:]
+                    + list(range(dimension))[:shift]
+                )
+            else:
+                permutation = tuple(range(dimension))
+            layers.append(
+                _SplineCoupling(
+                    mask=mask,
+                    permutation=permutation,
+                    hidden_features=self.config.hidden_features,
+                    num_bins=self.config.num_bins,
+                    tail_bound=self.config.tail_bound,
+                    min_bin_width=self.config.min_bin_width,
+                    min_bin_height=self.config.min_bin_height,
+                    min_derivative=self.config.min_derivative,
+                    name=f"coupling_{layer_index}",
+                )
+            )
+        self.layers = tuple(layers)
+        self.initial_raw_scale = self.param(
+            "initial_raw_scale",
+            nn.initializers.zeros_init(),
+            (dimension,),
+        )
+        self.initial_bias = self.param(
+            "initial_bias",
+            nn.initializers.zeros_init(),
+            (dimension,),
+        )
+        self.final_raw_scale = self.param(
+            "final_raw_scale",
+            nn.initializers.zeros_init(),
+            (dimension,),
+        )
+        self.final_bias = self.param(
+            "final_bias",
+            nn.initializers.zeros_init(),
+            (dimension,),
+        )
+
+    def _check_shape(self, inputs: Array) -> None:
+        if inputs.ndim < 1 or inputs.shape[-1] != self.config.dimension:
+            raise ValueError(
+                f"expected final dimension {self.config.dimension}, "
+                f"got shape {inputs.shape}"
+            )
+
+    def forward(self, inputs: Array) -> tuple[Array, Array]:
+        """Map intended target encodings ``z'`` to policy encodings ``z``."""
+        self._check_shape(inputs)
+        outputs, affine_log_det = _final_affine(
+            inputs,
+            self.final_raw_scale,
+            self.final_bias,
+            inverse=True,
+        )
+        log_det = (
+            jnp.zeros(inputs.shape[:-1], dtype=inputs.dtype)
+            + affine_log_det
+        )
+        for layer in reversed(self.layers):
+            outputs, layer_log_det = layer.inverse(outputs)
+            log_det = log_det + layer_log_det
+        outputs, initial_log_det = _final_affine(
+            outputs,
+            self.initial_raw_scale,
+            self.initial_bias,
+            inverse=True,
+        )
+        log_det = log_det + initial_log_det
+        return outputs, log_det
+
+    def reverse(self, inputs: Array) -> tuple[Array, Array]:
+        """Map policy encodings ``z`` to target encodings ``z'``."""
+        self._check_shape(inputs)
+        outputs, initial_log_det = _final_affine(
+            inputs,
+            self.initial_raw_scale,
+            self.initial_bias,
+            inverse=False,
+            return_log_det=True,
+        )
+        log_det = (
+            jnp.zeros(inputs.shape[:-1], dtype=inputs.dtype)
+            + initial_log_det
+        )
+        for layer in self.layers:
+            outputs, layer_log_det = layer.forward_with_log_det(outputs)
+            log_det = log_det + layer_log_det
+        outputs, affine_log_det = _final_affine(
+            outputs,
+            self.final_raw_scale,
+            self.final_bias,
+            inverse=False,
+            return_log_det=True,
+        )
+        return outputs, log_det + affine_log_det
+
+    def inverse(self, inputs: Array) -> tuple[Array, Array]:
+        """Inverse of :meth:`forward`, mapping policy encodings to targets."""
+        return self.reverse(inputs)
+
+    def __call__(self, inputs: Array) -> tuple[Array, Array]:
+        return self.forward(inputs)
 
 
 class NormalizingFlow(nn.Module):
@@ -361,6 +505,25 @@ class NormalizingFlow(nn.Module):
             key, (num_samples, self.config.dimension)
         )
         return self.forward(base_samples)
+
+
+def init_invertible_nsf(
+    key: Array,
+    config: FlowConfig,
+    *,
+    permute: bool = False,
+    dtype: Any = jnp.float32,
+) -> tuple[InvertibleNSF, dict[str, Any]]:
+    """Construct and initialize a distribution-free NSF mapping.
+
+    ``permute=False`` keeps every coupling in the input coordinate order, so
+    initialization stays close to the identity. ``permute=True`` applies the
+    same cyclic coordinate shifts used by :class:`NormalizingFlow`.
+    """
+    mapping = InvertibleNSF(config, permute=permute)
+    example = jnp.zeros((1, config.dimension), dtype=dtype)
+    variables = mapping.init(key, example)
+    return mapping, variables
 
 
 def init_flow(

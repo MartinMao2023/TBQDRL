@@ -19,6 +19,11 @@ from jax_rq_nsf import NormalizingFlow
 
 
 class MaternTaskState(PyTreeNode):
+    """
+    z: [sin(cycle_t), cos(cycle_t), 2 * task_t - 1, deviation_x, deviation_y] + sequence
+    sequence: 2 x [ds_1 / T, ds_2 / T, ..., ds_n / T, v_0, v_1, ..., v_n]
+    """
+    
     position_offset: jax.Array # (2,)
     last_action: jax.Array # (action_dim,)
 
@@ -28,7 +33,6 @@ class MaternTaskState(PyTreeNode):
     steps_taken: jax.Array
     cycle_t: float # absolute time within a period
     z: jnp.ndarray # (-1,)
-    # z: [s1_x, v1_x, s2_x, v2_x, ..., s1_y, v1_y, s2_y, s2_y, ..., sin(cycle_t), cos(cycle_t), 2 * task_t - 1]
 
 
 class GeneralizedState(PyTreeNode):
@@ -244,10 +248,11 @@ class AntFiniteMaternWrapper(BaseFlowQDWrapper):
             )
         squared_distance = jnp.square(l2_dist)
         fail = squared_distance > self.max_square_dist
-        reward = 0.5 * (
-            jnp.exp(-squared_distance * self.inner_scale) + 
-            jnp.exp(-squared_distance * self.outer_scale)
+        reward = (
+            0.75 * jnp.exp(-squared_distance * self.inner_scale) + 
+            0.25 * jnp.exp(-squared_distance * self.outer_scale)
             )
+            
         reward = jnp.where(completed | has_reset, 0.0, reward)
         last_action = jnp.where(has_reset, jnp.zeros_like(action), action)
         compensation = jnp.where(
