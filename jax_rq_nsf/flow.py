@@ -10,6 +10,11 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+from .coupling_layers import SplineCoupling
+from .spline_transforms import (
+    _gather, rational_quadratic_spline as _rational_quadratic_spline,
+)
+
 Array = jax.Array
 
 
@@ -25,6 +30,10 @@ class FlowConfig:
     min_bin_width: float = 1e-3
     min_bin_height: float = 1e-3
     min_derivative: float = 1e-3
+    # Geometry bounds used by safe_flow's ConstrainedSplineCoupling.
+    width_bound: float = 1.5
+    slope_bound: float = 1.5
+    derivative_bound: float = 1.0
 
     def __post_init__(self) -> None:
         if self.dimension < 2:
@@ -39,10 +48,10 @@ class FlowConfig:
             raise ValueError("min_bin_width is too large for the spline interval")
         if self.num_bins * self.min_bin_height >= 2 * self.tail_bound:
             raise ValueError("min_bin_height is too large for the spline interval")
-
-
-def _gather(values: Array, indices: Array) -> Array:
-    return jnp.take_along_axis(values, indices[..., None], axis=-1)[..., 0]
+        for name in ("width_bound", "slope_bound", "derivative_bound"):
+            bound = getattr(self, name)
+            if not math.isfinite(bound) or bound < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
 
 
 def _final_affine(
@@ -87,199 +96,44 @@ def _final_affine(
         return outputs
 
 
-def _rational_quadratic_spline(
-    inputs: Array,
-    parameters: Array,
-    *,
-    inverse: bool,
-    return_log_det: bool = False,
-    num_bins: int,
-    tail_bound: float,
-    min_bin_width: float,
-    min_bin_height: float,
-    min_derivative: float,
-) -> Array | tuple[Array, Array]:
-    """Apply elementwise monotonic RQ splines with identity linear tails."""
-    inside = (inputs >= -tail_bound) & (inputs <= tail_bound)
-    spline_inputs = jnp.clip(inputs, -tail_bound, tail_bound)
+# def _final_affine(
+#     inputs: Array,
+#     raw_scale: Array,
+#     bias: Array,
+#     *,
+#     inverse: bool,
+#     return_log_det: bool = False,
+# ) -> Array | tuple[Array, Array]:
+#     """Apply an elementwise affine transform with stable positive scales."""
 
-    raw_widths = parameters[..., :num_bins]
-    raw_heights = parameters[..., num_bins : 2 * num_bins]
-    raw_derivatives = parameters[..., 2 * num_bins :]
-
-    interval = 2.0 * tail_bound
-    widths = min_bin_width + (
-        interval - min_bin_width * num_bins
-    ) * jax.nn.softmax(raw_widths, axis=-1)
-    heights = min_bin_height + (
-        interval - min_bin_height * num_bins
-    ) * jax.nn.softmax(raw_heights, axis=-1)
-
-    derivative_offset = math.log(math.expm1(1.0 - min_derivative))
-    internal_derivatives = min_derivative + jax.nn.softplus(
-        raw_derivatives + derivative_offset
-    )
-    boundary = jnp.ones_like(internal_derivatives[..., :1])
-    derivatives = jnp.concatenate(
-        [boundary, internal_derivatives, boundary], axis=-1
-    )
-
-    left = jnp.full_like(widths[..., :1], -tail_bound)
-    x_knots = jnp.concatenate([left, left + jnp.cumsum(widths, axis=-1)], axis=-1)
-    y_knots = jnp.concatenate(
-        [left, left + jnp.cumsum(heights, axis=-1)], axis=-1
-    )
-
-    knots = y_knots if inverse else x_knots
-    bin_index = jnp.sum(spline_inputs[..., None] >= knots[..., 1:], axis=-1)
-    bin_index = jnp.clip(bin_index, 0, num_bins - 1)
-
-    x_left = _gather(x_knots[..., :-1], bin_index)
-    y_left = _gather(y_knots[..., :-1], bin_index)
-    bin_width = _gather(widths, bin_index)
-    bin_height = _gather(heights, bin_index)
-    derivative_left = _gather(derivatives[..., :-1], bin_index)
-    derivative_right = _gather(derivatives[..., 1:], bin_index)
-    slope = bin_height / bin_width
-
-    if inverse:
-        y_minus_left = spline_inputs - y_left
-        common = derivative_left + derivative_right - 2.0 * slope
-        a = y_minus_left * common + bin_height * (slope - derivative_left)
-        b = bin_height * derivative_left - y_minus_left * common
-        c = -slope * y_minus_left
-        discriminant = jnp.maximum(b * b - 4.0 * a * c, 0.0)
-        theta = (2.0 * c) / (-b - jnp.sqrt(discriminant))
-        theta = jnp.clip(theta, 0.0, 1.0)
-    else:
-        theta = (spline_inputs - x_left) / bin_width
-
-    one_minus_theta = 1.0 - theta
-    theta_product = theta * one_minus_theta
-    denominator = slope + (
-        derivative_left + derivative_right - 2.0 * slope
-    ) * theta_product
-
-    if inverse:
-        outputs = x_left + theta * bin_width
-    else:
-        numerator = bin_height * (
-            slope * theta * theta + derivative_left * theta_product
-        )
-        outputs = y_left + numerator / denominator
-
-    outputs = jnp.where(inside, outputs, inputs)
-    if not inverse and not return_log_det:
-        return outputs
-
-    derivative_numerator = slope * slope * (
-        derivative_right * theta * theta
-        + 2.0 * slope * theta_product
-        + derivative_left * one_minus_theta * one_minus_theta
-    )
-    log_det = jnp.log(derivative_numerator) - 2.0 * jnp.log(denominator)
-    if inverse:
-        log_det = -log_det
-
-    log_det = jnp.where(inside, log_det, 0.0)
-    return outputs, log_det
+#     if inverse:
+#         outputs = inputs - bias
+#         return outputs, 0.0
+#     else:
+#         outputs = inputs + bias
+#         if return_log_det:
+#             return outputs, 0.0
+#         return outputs
 
 
-class _Conditioner(nn.Module):
-    hidden_features: tuple[int, ...]
-    output_size: int
 
-    @nn.compact
-    def __call__(self, inputs: Array) -> Array:
-        x = inputs
-        for width in self.hidden_features:
-            x = nn.Dense(width)(x)
-            x = nn.selu(x)
-        return nn.Dense(
-            self.output_size,
-            kernel_init=nn.initializers.normal(1e-3),
-            bias_init=nn.initializers.zeros_init(),
-        )(x)
+def _even_coupling_shift(
+    layer_index: int, dimension: int, num_layers: int
+) -> int:
+    """Return the left-rotation applied by one coupling layer.
+
+    Earlier rotations remain in the activation, so a constant step of
+    ``dimension // num_layers`` makes the cumulative alignments
+    ``0, step, 2 * step, ...``.
+    """
+    if layer_index == 0:
+        return 0
+    return dimension // num_layers
 
 
-class _SplineCoupling(nn.Module):
-    mask: tuple[bool, ...]
-    permutation: tuple[int, ...]
-    hidden_features: tuple[int, ...]
-    num_bins: int
-    tail_bound: float
-    min_bin_width: float
-    min_bin_height: float
-    min_derivative: float
-
-    def setup(self) -> None:
-        dimension = len(self.mask)
-        self.identity_indices = jnp.asarray(
-            [i for i, fixed in enumerate(self.mask) if fixed]
-        )
-        self.transform_indices = jnp.asarray(
-            [i for i, fixed in enumerate(self.mask) if not fixed]
-        )
-        self.permutation_array = jnp.asarray(self.permutation)
-        inverse_permutation = [0] * dimension
-        for destination, source in enumerate(self.permutation):
-            inverse_permutation[source] = destination
-        self.inverse_permutation_array = jnp.asarray(inverse_permutation)
-
-        parameters_per_dimension = 3 * self.num_bins - 1
-        self.conditioner = _Conditioner(
-            hidden_features=self.hidden_features,
-            output_size=len(self.transform_indices) * parameters_per_dimension,
-        )
-
-    def _couple(
-        self,
-        inputs: Array,
-        *,
-        inverse: bool,
-        return_log_det: bool = False,
-    ) -> Array | tuple[Array, Array]:
-        identity = inputs[..., self.identity_indices]
-        transformed = inputs[..., self.transform_indices]
-        parameters = self.conditioner(identity)
-        parameters = parameters.reshape(
-            transformed.shape + (3 * self.num_bins - 1,)
-        )
-        spline_result = _rational_quadratic_spline(
-            transformed,
-            parameters,
-            inverse=inverse,
-            return_log_det=return_log_det,
-            num_bins=self.num_bins,
-            tail_bound=self.tail_bound,
-            min_bin_width=self.min_bin_width,
-            min_bin_height=self.min_bin_height,
-            min_derivative=self.min_derivative,
-        )
-        if inverse or return_log_det:
-            transformed, elementwise_log_det = spline_result
-        else:
-            transformed = spline_result
-        outputs = inputs.at[..., self.transform_indices].set(transformed)
-        if inverse or return_log_det:
-            return outputs, jnp.sum(elementwise_log_det, axis=-1)
-        return outputs
-
-    def __call__(self, inputs: Array) -> Array:
-        permuted = inputs[..., self.permutation_array]
-        return self._couple(permuted, inverse=False)
-
-    def forward_with_log_det(self, inputs: Array) -> tuple[Array, Array]:
-        permuted = inputs[..., self.permutation_array]
-        return self._couple(
-            permuted,
-            inverse=False,
-            return_log_det=True,
-        )
-
-    def inverse(self, inputs: Array) -> tuple[Array, Array]:
-        outputs, log_det = self._couple(inputs, inverse=True)
-        return outputs[..., self.inverse_permutation_array], log_det
+def _rotated_indices(dimension: int, shift: int) -> tuple[int, ...]:
+    coordinates = list(range(dimension))
+    return tuple(coordinates[shift:] + coordinates[:shift])
 
 
 class InvertibleNSF(nn.Module):
@@ -297,15 +151,14 @@ class InvertibleNSF(nn.Module):
                 for coordinate in range(dimension)
             )
             if self.permute:
-                shift = layer_index % dimension
-                permutation = tuple(
-                    list(range(dimension))[shift:]
-                    + list(range(dimension))[:shift]
+                shift = _even_coupling_shift(
+                    layer_index, dimension, self.config.num_layers
                 )
+                permutation = _rotated_indices(dimension, shift)
             else:
                 permutation = tuple(range(dimension))
             layers.append(
-                _SplineCoupling(
+                SplineCoupling(
                     mask=mask,
                     permutation=permutation,
                     hidden_features=self.config.hidden_features,
@@ -346,8 +199,12 @@ class InvertibleNSF(nn.Module):
                 f"got shape {inputs.shape}"
             )
 
-    def forward(self, inputs: Array) -> tuple[Array, Array]:
-        """Map intended target encodings ``z'`` to policy encodings ``z``."""
+    def forward(self, inputs: Array) -> tuple[Array, Array, Array]:
+        """Map intended targets ``z'`` to policy inputs ``z``.
+
+        Returns the mapped encoding, its log absolute determinant, and
+        ``forward_boundary_loss``.
+        """
         self._check_shape(inputs)
         outputs, affine_log_det = _final_affine(
             inputs,
@@ -359,35 +216,50 @@ class InvertibleNSF(nn.Module):
             jnp.zeros(inputs.shape[:-1], dtype=inputs.dtype)
             + affine_log_det
         )
+        forward_boundary_loss = 0.0
         for layer in reversed(self.layers):
-            outputs, layer_log_det = layer.inverse(outputs)
+            outputs, layer_log_det, layer_boundary_loss = layer.inverse(
+                outputs,
+                return_boundary_loss=True,
+            )
             log_det = log_det + layer_log_det
+            forward_boundary_loss = forward_boundary_loss + layer_boundary_loss
         outputs, initial_log_det = _final_affine(
             outputs,
-            self.initial_raw_scale,
-            self.initial_bias,
-            inverse=True,
-        )
-        log_det = log_det + initial_log_det
-        return outputs, log_det
-
-    def reverse(self, inputs: Array) -> tuple[Array, Array]:
-        """Map policy encodings ``z`` to target encodings ``z'``."""
-        self._check_shape(inputs)
-        outputs, initial_log_det = _final_affine(
-            inputs,
             self.initial_raw_scale,
             self.initial_bias,
             inverse=False,
             return_log_det=True,
         )
+        log_det = log_det + initial_log_det
+        return outputs, log_det, forward_boundary_loss / self.config.num_layers
+
+    def reverse(self, inputs: Array) -> tuple[Array, Array, Array]:
+        """Map policy inputs ``z`` to target encodings ``z'``.
+
+        Returns the mapped encoding, its log absolute determinant, and
+        ``reverse_boundary_loss``.
+        """
+        self._check_shape(inputs)
+        outputs, initial_log_det = _final_affine(
+            inputs,
+            self.initial_raw_scale,
+            self.initial_bias,
+            inverse=True,
+        )
         log_det = (
             jnp.zeros(inputs.shape[:-1], dtype=inputs.dtype)
             + initial_log_det
         )
+        reverse_boundary_loss = 0.0
         for layer in self.layers:
-            outputs, layer_log_det = layer.forward_with_log_det(outputs)
+            (
+                outputs,
+                layer_log_det,
+                layer_boundary_loss,
+            ) = layer.forward_with_log_det(outputs)
             log_det = log_det + layer_log_det
+            reverse_boundary_loss = reverse_boundary_loss + layer_boundary_loss
         outputs, affine_log_det = _final_affine(
             outputs,
             self.final_raw_scale,
@@ -395,13 +267,13 @@ class InvertibleNSF(nn.Module):
             inverse=False,
             return_log_det=True,
         )
-        return outputs, log_det + affine_log_det
+        return outputs, log_det + affine_log_det, reverse_boundary_loss / self.config.num_layers
 
-    def inverse(self, inputs: Array) -> tuple[Array, Array]:
+    def inverse(self, inputs: Array) -> tuple[Array, Array, Array]:
         """Inverse of :meth:`forward`, mapping policy encodings to targets."""
         return self.reverse(inputs)
 
-    def __call__(self, inputs: Array) -> tuple[Array, Array]:
+    def __call__(self, inputs: Array) -> tuple[Array, Array, Array]:
         return self.forward(inputs)
 
 
@@ -423,7 +295,7 @@ class NormalizingFlow(nn.Module):
                 list(range(dimension))[shift:] + list(range(dimension))[:shift]
             )
             layers.append(
-                _SplineCoupling(
+                SplineCoupling(
                     mask=mask,
                     permutation=permutation,
                     hidden_features=self.config.hidden_features,
@@ -485,19 +357,19 @@ class NormalizingFlow(nn.Module):
             log_det = log_det + layer_log_det
         return outputs, log_det
 
-    def base_log_prob(self, base_samples: Array) -> Array:
-        """Log-density under the standard multivariate Gaussian base."""
+    def base_log_prob(self, base_samples: Array, *, include_constant: bool = False) -> Array:
+        """Gaussian log-density, omitting d/2 * log(2*pi) by default."""
         self._check_shape(base_samples)
-        normalizer = self.config.dimension * math.log(2.0 * math.pi)
+        normalizer = self.config.dimension * math.log(2.0 * math.pi) if include_constant else 0.0
         return -0.5 * (jnp.sum(base_samples * base_samples, axis=-1) + normalizer)
 
-    def log_prob(self, samples: Array) -> Array:
-        """Evaluate normalized log-density in data space."""
+    def log_prob(self, samples: Array, *, include_constant: bool = False) -> Array:
+        """Evaluate log-density; include_constant=True restores normalization."""
         base_samples, inverse_log_det = self.inverse(samples)
-        return self.base_log_prob(base_samples) + inverse_log_det
+        return self.base_log_prob(base_samples, include_constant=include_constant) + inverse_log_det
 
-    def __call__(self, samples: Array) -> Array:
-        return self.log_prob(samples)
+    def __call__(self, samples: Array, *, include_constant: bool = False) -> Array:
+        return self.log_prob(samples, include_constant=include_constant)
 
     def sample(self, key: Array, num_samples: int) -> Array:
         """Draw samples without computing their density."""
@@ -517,8 +389,9 @@ def init_invertible_nsf(
     """Construct and initialize a distribution-free NSF mapping.
 
     ``permute=False`` keeps every coupling in the input coordinate order, so
-    initialization stays close to the identity. ``permute=True`` applies the
-    same cyclic coordinate shifts used by :class:`NormalizingFlow`.
+    initialization stays close to the identity. ``permute=True`` rotates each
+    layer after the first by ``dimension // num_layers``, giving evenly spaced
+    cumulative alignments.
     """
     mapping = InvertibleNSF(config, permute=permute)
     example = jnp.zeros((1, config.dimension), dtype=dtype)
